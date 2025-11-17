@@ -8,6 +8,9 @@ Validador Maestro para servitel
 
 ## Uso
 python -m venv .venv
+
 .venv\Scripts\activate
+
 pip install -r requirements.txt
+
 streamlit run app_streamlit_reglas.py
