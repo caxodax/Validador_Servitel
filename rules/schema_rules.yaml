@@ -1,0 +1,176 @@
+# Esquema de validación para archivo MAESTRO
+# Define el orden esperado de las columnas y el tipo de dato básico.
+
+column_order:
+  - "* CODIGO CONTRATO"
+  - "* NOMBRES"
+  - "* APELLIDOS"
+  - "* NOMBRES / RAZON SOCIAL"
+  - "* ESTADO"
+  - "* TIPO DOCUMENTO"
+  - "* N. DOCUMENTO"
+  - "* E-MAIL"
+  - "TELEFONOS"
+  - "SOBRENOMBRE - CODIGO ANTERIOR"
+  - "VENDEDOR INSTALACION"
+  - "* DURACION (MESES)"
+  - "* FECHA NACIMIENTO"
+  - "* FECHA CONTRATO"
+  - "* FECHA FIRMA"
+  - "* FECHA ULTIMO CORTE"
+  - "PENALIDAD"
+  - "* DIA COBRO"
+  - "* DIA CORTE"
+  - "* TIPO DE COMPROBANTE"
+  - "* TIPO DE COBRO"
+  - "* CONDICION DEL CLIENTE"
+  - "OBSERVACIONES CONTRATO"
+  - "* SEXO"
+  - "* MONEDA CONTRATO"
+  - "REFERENCIA NOMBRE"
+  - "REFERENCIA IDENTIFICACION"
+  - "REFERENCIA CONTACTO"
+  - "REFERENCIA PARENTEZCO"
+  - "* TIPO DE CLIENTE"
+  - "PAIS"
+  - "ESTADO"
+  - "MUNICIPIO"
+  - "MUNICIPIO"
+  - "PARROQUIA"
+  - "SECTOR"
+  - "BARRIO"
+  - "ZONA"
+  - "TIPO CALLE"
+  - "CALLE / DIRECCION"
+  - "TIPO DE CONJUNTO"
+  - "TIPO VIVIENDA"
+  - "RUTA"
+  - "ORDEN RUTA"
+  - "CALLE PRINCIPAL"
+  - "NUMERO DE CASA"
+  - "CALLE SECUNDARIA"
+  - "DIRECCION"
+  - "REFERENCIA DIRECCION"
+  - "LATITUD"
+  - "LONGITUD"
+  - "PLAN TV ANALOGA"
+  - "PRECIO DE TV ANALOGA"
+  - "ADICIONALES TV ANALOGA"
+  - "PRECIO TV ADICIONALES"
+  - "PRECINTO"
+  - "DEUDA TV"
+  - "PLAN DE INTERNET"
+  - "PRECIO DE INTERNET"
+  - "NUMERO DE SERIE ONT"
+  - "SERIES ADICIONALES"
+  - "IP"
+  - "PUERTO PON"
+  - "VLAN"
+  - "MAC"
+  - "OLT"
+  - "MIKROTIK"
+  - "VIÑETA"
+  - "TECNOLOGIA"
+  - "NAP"
+  - "PUERTO (NAP)"
+  - "USUARIO PPPOE"
+  - "CLAVE PPPOE"
+  - "MODELO ONU"
+  - "DEUDA INTERNET"
+  - "PLAN DE CATV"
+  - "PRECIO DE CATV"
+  - "DEUDA CATV"
+  - "PLAN DE IPTV"
+  - "PRECIO DE IPTV"
+  - "DEUDA IPTV"
+  - "PLAN DE TELEFONIA"
+  - "PRECIO DE TELEFONIA"
+  - "DEUDA TELEFONIA"
+  - "PLAN DE CAJA DIGITAL"
+  - "PRECIO DE CAJA DIGITAL"
+  - "DEUDA CAJA DIGITAL"
+  - "STB"
+  - "TARJETA HD"
+  - "DESCRIPCION"
+  - "VALOR"
+  - "FECHA CARGO ADICIONAL"
+  - "SUCURSAL"
+  - "NUMERO DE CALLE"
+
+rules:
+  # --- Campos de texto obligatorio ---
+  - campo: "*CODIGO CONTRATO"
+    tipo: text
+    obligatorio: true
+
+  - campo: "*NOMBRES"
+    tipo: text
+    obligatorio: true
+
+  - campo: "*APELLIDOS"
+    tipo: text
+    obligatorio: true
+
+  - campo: "*ESTADO"
+    tipo: text
+    obligatorio: true
+    opciones:
+      - ACTIVO
+      - CORTADO
+      - RETIRADO
+      - PENDIENTE
+      - POR INSTALACION
+
+  # --- Documentos ---
+  - campo: "*TIPO DOCUMENTO"
+    tipo: text
+    obligatorio: true
+    opciones:
+      - CEDULA
+      - RUC
+      - PASAPORTE
+      - JURIDICO
+      - EXTRANJERO
+      - GOBIERNO
+
+  - campo: "*N. DOCUMENTO"
+    tipo: number
+    obligatorio: true
+    descripcion: "Debe contener solo dígitos, sin letras ni símbolos."
+
+  # --- Correo ---
+  - campo: "*E-MAIL"
+    tipo: email
+    obligatorio: true
+    descripcion: "Debe contener dominio permitido: gmail, hotmail, outlook o yahoo."
+
+  # --- Fechas ---
+  - campo: "FECHA ACTIVACION"
+    tipo: date
+    obligatorio: false
+  - campo: "FECHA INSTALACION"
+    tipo: date
+    obligatorio: false
+  - campo: "FECHA ULTIMO PAGO"
+    tipo: date
+    obligatorio: false
+  - campo: "FECHA CORTE"
+    tipo: date
+    obligatorio: false
+
+  # --- IP ---
+  - campo: "IP"
+    tipo: ip
+    obligatorio: true
+    descripcion: "Debe ser una dirección IPv4 o IPv6 válida. IPs privadas se marcarán como advertencia."
+
+  # --- Otros campos informativos ---
+  - campo: "MAC"
+    tipo: text
+    obligatorio: false
+  - campo: "OLT"
+    tipo: text
+    obligatorio: false
+  - campo: "MIKROTIK"
+    tipo: text
+    obligatorio: false
