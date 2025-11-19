@@ -2,10 +2,12 @@
 import io, os, re, yaml, difflib, datetime
 import pandas as pd
 import streamlit as st
+from pathlib import Path
 from validator import apply_non_destructive_normalization, apply_auto_fixes, validate_dataframe
-
+from openpyxl import Workbook
 from openpyxl.styles import Border, Side, Alignment, Font, PatternFill
 from openpyxl.utils.dataframe import dataframe_to_rows
+
 
 MAESTRO_SHEET = "MAESTRO"
 
@@ -56,8 +58,68 @@ COMMON_DOMAIN_TYPO_MAP = {
     "yaho.com":    "yahoo.com",
 }
 
-st.set_page_config(page_title="Validador MAESTRO ", layout="wide")
-st.title("Validador MAESTRO")
+# === FAVICON PERSONALIZADO ===
+import base64
+from pathlib import Path
+
+BASE_DIR = Path(__file__).parent
+assets_dir = BASE_DIR / "assets"
+favicon_path = assets_dir / "icono_servitel.ico"
+
+favicon_bytes = None
+if favicon_path.exists():
+    favicon_bytes = open(favicon_path, "rb").read()
+
+# === CONFIGURACIÓN DE PÁGINA ===
+st.set_page_config(
+    page_title="Validador - Servitel",
+    page_icon=favicon_bytes,   # ← tu .ico real convertido a bytes
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
+
+
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def find_logo(*relative_paths):
+    """
+    Devuelve la primera ruta existente dentro de BASE_DIR de la lista dada.
+    Ejemplo de uso:
+      find_logo("assets/logo_servitel.jpg", "assets/logo_servitel.png")
+    """
+    for rel in relative_paths:
+        path = os.path.join(BASE_DIR, rel)
+        if os.path.exists(path):
+            return path
+    return None
+
+# --- Encabezado con logo Servitel centrado y título ---
+BASE_DIR = Path(__file__).parent
+assets_dir = BASE_DIR / "assets"
+
+col_left, col_center, col_right = st.columns([1, 2, 1])
+
+with col_center:
+    servitel_logo = None
+    if assets_dir.exists():
+        candidates = list(assets_dir.glob("logo_servitel*"))
+        if candidates:
+            servitel_logo = candidates[0]
+
+    if servitel_logo is not None:
+        st.image(str(servitel_logo), use_column_width=True)
+
+    # Título centrado debajo del logo
+    st.markdown(
+        "<h1 style='text-align:center; margin-bottom: 0;'>Validador MAESTRO</h1>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        "<p style='text-align:center; color:#777; margin-top: 0;'>Sistema interno de validación de contratos</p>",
+        unsafe_allow_html=True,
+    )
+
 
 # =================== LECTURA INTELIGENTE DE ENCABEZADOS ===================
 HEADER_ROW_INDEX = 1  # segunda fila (0-based)
@@ -98,6 +160,56 @@ def load_rules():
         return yaml.safe_load(f)
 rules_pkg = load_rules()
 COLUMN_ORDER = rules_pkg.get("column_order", None)
+# ---------- Normalización de nombres de columnas para comparación ----------
+def normalize_colname_for_match(name: str) -> str:
+    """
+    Normaliza nombres de columnas para comparación lógica:
+    - Convierte a str.
+    - Reemplaza espacios raros.
+    - Colapsa espacios múltiples.
+    - Quita asteriscos iniciales (*OBSERVACIONES -> OBSERVACIONES).
+    - Pasa a MAYÚSCULAS.
+    """
+    s = str(name)
+    s = s.replace("\xa0", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    # Quitar asterisco(s) inicial(es) y espacio que le siga, si aplica
+    s = re.sub(r"^\*+\s*", "", s)
+    return s.upper()
+
+
+def compare_columns_with_details(expected, received):
+    """
+    Compara listas de columnas usando la versión normalizada para igualdad,
+    y devuelve:
+      - ok: bool -> True si coinciden (tras normalizar).
+      - diff_df: DataFrame con las posiciones donde NO coinciden.
+    """
+    norm_expected = [normalize_colname_for_match(c) for c in expected]
+    norm_received = [normalize_colname_for_match(c) for c in received]
+
+    ok = norm_expected == norm_received
+
+    diffs = []
+    max_len = max(len(expected), len(received))
+    for i in range(max_len):
+        exp_raw  = expected[i] if i < len(expected) else ""
+        rec_raw  = received[i] if i < len(received) else ""
+        exp_norm = norm_expected[i] if i < len(norm_expected) else ""
+        rec_norm = norm_received[i] if i < len(norm_received) else ""
+
+        if exp_norm != rec_norm:
+            diffs.append({
+                "posición": i,
+                "esperado": exp_raw,
+                "recibido": rec_raw,
+                "esperado_norm": exp_norm,
+                "recibido_norm": rec_norm,
+            })
+
+    diff_df = pd.DataFrame(diffs)
+    return ok, diff_df
+
 
 # ---------- Helpers encabezados (solo visual) ----------
 def is_unnamed(col_name) -> bool:
@@ -109,6 +221,30 @@ def build_column_config(df: pd.DataFrame):
         label = "" if is_unnamed(c) else str(c)
         cfg[c] = st.column_config.Column(label=label)
     return cfg
+# ------- Resalta el error de columnas ---------------
+def highlight_column_list(columns, diff_df):
+    """
+    Devuelve una lista con:
+    - 🔴 emoji de alerta
+    - Texto en negrita
+    - Fondo rojo suave para columnas incorrectas
+    - Formato: índice + nombre de columna
+    """
+    bad_positions = set(diff_df["posición"].tolist())
+    styled = []
+
+    for i, col in enumerate(columns):
+        if i in bad_positions:
+            styled.append(
+                f"<span style='background-color:#ffcccc; padding:3px 6px; border-radius:4px;'>"
+                f"🔴 <b>{i}: {col}</b>"
+                f"</span>"
+            )
+        else:
+            styled.append(f"{i}: {col}")
+
+    return styled
+
 
 # ---------- Columnas duplicadas: helpers ----------
 def make_unique_labels(labels):
@@ -696,16 +832,38 @@ def _blank_unnamed_headers(ws, header_row_index: int, col_names):
         if str(name).lower().startswith("unnamed"):
             ws.cell(row=header_row_index, column=i).value = ""
 
-def write_excel_with_errors(df: pd.DataFrame, errores: pd.DataFrame, rules_pkg, title_for_unnamed="INFORMACION DEL ABONADO"):
-    from openpyxl import Workbook
-    df_to_write = ensure_datetime_columns(df)
+def write_excel_with_errors(df, errores, rules_pkg, title_for_unnamed="INFORMACION DEL ABONADO"):
+    """
+    Exporta el MAESTRO con:
+    - Limpieza de NA/NaN/<NA>/NaT -> None (celdas vacías en Excel)
+    - Marcado de celdas con error (borde + fondo rojo claro)
+    - Formato de fechas DD/MM/YYYY
+    """
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "MAESTRO"
 
-    wb = Workbook(); ws = wb.active; ws.title = MAESTRO_SHEET
-    for r in dataframe_to_rows(df_to_write, index=False, header=True):
-        ws.append(r)
+    # 1) Aseguramos tipos datetime donde corresponde (para que Excel entienda bien las fechas)
+    df_to_write = ensure_datetime_columns(df.copy())
+
+    # 2) Reemplazar TODOS los valores nulos (NaN, <NA>, NaT, None) por None
+    #    pd.notna(...) es False para NaN, NaT y <NA>, True para valores reales
+    df_to_write = df_to_write.where(pd.notna(df_to_write), None)
+
+    # 3) Volcar el DataFrame a la hoja, limpiando cualquier valor problemático en la fila
+    for row in dataframe_to_rows(df_to_write, index=False, header=True):
+        clean_row = []
+        for v in row:
+            # Cualquier cosa "nula" la convertimos a None (celda vacía)
+            if v is None or (isinstance(v, float) and pd.isna(v)):
+                clean_row.append(None)
+            else:
+                clean_row.append(v)
+        ws.append(clean_row)
 
     col_names = list(df_to_write.columns)
-    # Inserta título para el bloque de columnas sin nombre y deja headers en blanco
+
+    # 4) Insertar fila de título si hay columnas "Unnamed"
     unnamed_idxs = [i for i, c in enumerate(col_names, start=1) if str(c).lower().startswith("unnamed")]
     if unnamed_idxs:
         ws.insert_rows(1)
@@ -720,17 +878,25 @@ def write_excel_with_errors(df: pd.DataFrame, errores: pd.DataFrame, rules_pkg, 
     header_row_index = 2 if unnamed_idxs else 1
     _blank_unnamed_headers(ws, header_row_index, col_names)
 
-    # Bordes rojos + RELLENO rojo claro
+    # 5) Estilos para marcar errores
     red = Side(style="thin", color="FF0000")
     red_border = Border(left=red, right=red, top=red, bottom=red)
     light_red_fill = PatternFill(fill_type="solid", fgColor="FFFFC7CE")  # rojo claro
 
     if errores is not None and not errores.empty:
-        # Usamos col_idx si está disponible
         for _, r in errores.iterrows():
-            fila1 = int(r["fila"])
+            try:
+                fila1 = int(r["fila"])
+            except Exception:
+                continue
+
+            # Usamos col_idx si está disponible
             if "col_idx" in r and not pd.isna(r["col_idx"]):
-                col_idx0 = int(r["col_idx"])
+                try:
+                    col_idx0 = int(r["col_idx"])
+                except Exception:
+                    continue
+
                 if 0 <= col_idx0 < len(col_names):
                     excel_row = fila1 + header_row_index + 1
                     excel_col = col_idx0 + 1
@@ -738,6 +904,7 @@ def write_excel_with_errors(df: pd.DataFrame, errores: pd.DataFrame, rules_pkg, 
                     cell.border = red_border
                     cell.fill = light_red_fill
             else:
+                # Fallback: por nombre de columna
                 col_name = str(r["columna"])
                 matches = [j for j, name in enumerate(col_names) if str(name) == col_name]
                 for col_idx0 in matches:
@@ -747,24 +914,31 @@ def write_excel_with_errors(df: pd.DataFrame, errores: pd.DataFrame, rules_pkg, 
                     cell.border = red_border
                     cell.fill = light_red_fill
 
-    # Ancho columnas
+    # 6) Ajuste de ancho de columnas
     for i, c in enumerate(col_names, start=1):
-        ws.column_dimensions[ws.cell(row=header_row_index, column=i).column_letter].width = max(12, min(35, len(str(c)) + 4))
+        col_letter = ws.cell(row=header_row_index, column=i).column_letter
+        ws.column_dimensions[col_letter].width = max(12, min(35, len(str(c)) + 4))
 
-    # Formato fechas DD/MM/YYYY
+    # 7) Formato de fechas DD/MM/YYYY
     date_cols_by_name = date_columns_from_rules(rules_pkg)
     for pos in DATE_POSITIONS:
         if pos < len(col_names):
             date_cols_by_name.append(col_names[pos])
+
     if date_cols_by_name:
         name_to_idx = {name: idx for idx, name in enumerate(col_names, start=1)}
         for dc in date_cols_by_name:
             if dc in name_to_idx:
                 cidx = name_to_idx[dc]
                 for r in range(header_row_index + 1, ws.max_row + 1):
-                    ws.cell(row=r, column=cidx).number_format = "DD/MM/YYYY"
+                    cell = ws.cell(row=r, column=cidx)
+                    if cell.value is not None:
+                        cell.number_format = "DD/MM/YYYY"
 
-    out = io.BytesIO(); wb.save(out); return out.getvalue()
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
 
 def write_excel_validated(df: pd.DataFrame, rules_pkg, title_for_unnamed="INFORMACION DEL ABONADO"):
     return write_excel_with_errors(df, errores=pd.DataFrame(), rules_pkg=rules_pkg, title_for_unnamed=title_for_unnamed)
@@ -789,37 +963,35 @@ if "edited_df" not in st.session_state:
 
 if archivo:
     try:
-        # Solo procesamos desde cero si aún no hay DF en sesión
-        if st.session_state["current_df"] is None:
-            # LECTURA INTELIGENTE (usa fila 2 como encabezado si corresponde)
-            df_raw = smart_read_maestro(archivo)
+        # --- SIEMPRE REINICIAR AL CARGAR UN ARCHIVO NUEVO ---
+        st.session_state["current_df"] = None
+        st.session_state["edited_df"] = None
 
-            # Normalización y fixes base
-            df_norm  = apply_non_destructive_normalization(df_raw)
-            df_fixed = apply_auto_fixes(df_norm, rules_pkg)
-            df_fixed = force_uppercase_first_cols(df_fixed, n=UPPERCASE_N)
-            df_fixed, tipo_errs_all = infer_tipo_documento_from_docnum(df_fixed, TIPO_DOC_POS, DOC_NUM_POS)
-            df_fixed = normalize_text_apostrophe(df_fixed)
+        # --- LECTURA INTELIGENTE DESDE CERO ---
+        df_raw = smart_read_maestro(archivo)
 
-            df_fixed = digits_only_column(df_fixed, DOC_NUM_POS)
-            if "MAC" in df_fixed.columns:
-                df_fixed["MAC"] = df_fixed["MAC"].map(clean_mac)
+        # Normalización base
+        df_norm  = apply_non_destructive_normalization(df_raw)
+        df_fixed = apply_auto_fixes(df_norm, rules_pkg)
+        df_fixed = force_uppercase_first_cols(df_fixed, n=UPPERCASE_N)
+        df_fixed, tipo_errs_all = infer_tipo_documento_from_docnum(df_fixed, TIPO_DOC_POS, DOC_NUM_POS)
+        df_fixed = normalize_text_apostrophe(df_fixed)
 
-            df_fixed = normalize_vlan(df_fixed)
-            df_fixed, corrections_df, info_email_errors = apply_email_autocorrect(df_fixed, EMAIL_POS, enable_autocorrect)
+        df_fixed = digits_only_column(df_fixed, DOC_NUM_POS)
 
-            st.session_state["current_df"] = df_fixed.copy()
-            st.session_state["edited_df"]  = None  # se poblará desde el editor
-        else:
-            # Ya existe DF en sesión: usamos ese (con posibles ediciones previas)
-            df_fixed = st.session_state["current_df"].copy()
-            tipo_errs_all = pd.DataFrame(columns=["fila","columna","col_idx","regla","detalle","severity"])
-            corrections_df = pd.DataFrame(columns=["fila","original","nuevo","detalle","timestamp"])
-            info_email_errors = pd.DataFrame(columns=["fila","columna","col_idx","regla","detalle","severity"])
+        if "MAC" in df_fixed.columns:
+            df_fixed["MAC"] = df_fixed["MAC"].map(clean_mac)
 
-        # Validación desde fila 0 sobre el DF actual
+        df_fixed = normalize_vlan(df_fixed)
+        df_fixed, corrections_df, info_email_errors = apply_email_autocorrect(df_fixed, EMAIL_POS, enable_autocorrect)
+
+        st.session_state["current_df"] = df_fixed.copy()
+        st.session_state["edited_df"]  = None
+
+        # ---------------- VALIDACIÓN ----------------
         df_valid = df_fixed.copy()
         df_valid.index = range(len(df_valid))
+
         errores_yaml = validate_dataframe(df_valid, rules_pkg)
         errores_pos  = validate_position_rules(df_valid)
 
@@ -831,23 +1003,48 @@ if archivo:
         for e in (errores_yaml, errores_pos, tipo_errs, info_email_errors):
             if e is not None and not e.empty:
                 if "severity" not in e.columns:
-                    e = e.copy(); e["severity"] = "error"
+                    e = e.copy()
+                    e["severity"] = "error"
                 frames.append(e)
+
         errores = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["fila","columna","col_idx","regla","detalle","severity"])
+
+        # =================== SIGUE TODO LO DEMÁS ===================
 
         # --- VISTA PREVIA con sombreado ---
         st.subheader("Vista previa (errores=rojo, avisos=amarillo, info=verde)")
         df_preview = format_dates_for_display(st.session_state["current_df"].head(20), rules_pkg)
         st.dataframe(style_error_cells_ui(df_preview, errores), use_container_width=True)
 
-        # Estructura (compara con nombres REALES, no los únicos de UI)
-        if COLUMN_ORDER is not None and list(st.session_state["current_df"].columns) != list(COLUMN_ORDER):
-            st.error("❌ Las columnas NO coinciden exactamente con el formato esperado.")
-            with st.expander("Ver detalle de columnas"):
-                st.write("Esperado:", COLUMN_ORDER); st.write("Recibido:", list(st.session_state["current_df"].columns))
-            st.stop()
-        else:
-            st.success("✅ Estructura OK (columnas y orden idénticos).")
+        # Estructura (compara con nombres REALES pero normalizados para pequeños detalles)
+        if COLUMN_ORDER is not None:
+            expected_cols = list(COLUMN_ORDER)
+            received_cols = list(st.session_state["current_df"].columns)
+
+            ok_structure, diff_df = compare_columns_with_details(expected_cols, received_cols)
+
+            if not ok_structure:
+                st.error("❌ Las columnas NO coinciden exactamente con el formato esperado.")
+                with st.expander("Ver detalle de columnas"):
+                    # Primero: diferencias puntuales
+                    if not diff_df.empty:
+                        st.write("Diferencias por posición (solo donde NO coinciden):")
+                        st.dataframe(diff_df, use_container_width=True)
+                        st.markdown("---")
+
+                    # Luego: listas completas
+                        st.write("Listado completo de columnas esperadas:")
+                        st.markdown("<br>".join(highlight_column_list(expected_cols, diff_df)), unsafe_allow_html=True)
+
+                        st.write("Listado completo de columnas recibidas:")
+                        st.markdown("<br>".join(highlight_column_list(received_cols, diff_df)), unsafe_allow_html=True)
+
+
+                st.stop()
+            else:
+                st.success("✅ Estructura OK (columnas y orden coherentes).")
+
+
 
         # Correcciones de correo aplicadas (info)
         if enable_autocorrect and corrections_df is not None and not corrections_df.empty:
@@ -1030,3 +1227,71 @@ if archivo:
         st.exception(e)
 else:
     st.info("Sube un archivo para validar.")
+
+# ====================== FOOTER HORIZONTAL CON LOGO FOXBYTE ======================
+
+import base64
+from pathlib import Path
+
+# Detectar carpeta /assets
+BASE_DIR = Path(__file__).parent
+assets_dir = BASE_DIR / "assets"
+
+# Convertir logo Foxbyte a base64
+footer_logo_b64 = None
+if assets_dir.exists():
+    candidates = list(assets_dir.glob("logo_foxbyte*"))
+    if candidates:
+        with open(candidates[0], "rb") as f:
+            footer_logo_b64 = base64.b64encode(f.read()).decode()
+
+# CSS + HTML del footer
+footer_html = f"""
+<style>
+.app-footer {{
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+
+    background-color: rgba(255,255,255,0.95);
+    border-top: 1px solid #ddd;
+
+    display: flex;
+    align-items: center;
+    justify-content: center;   /* Centrado perfecto */
+
+    padding: 6px 0;
+    z-index: 999;
+}}
+
+.footer-inner {{
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;   /* espacio entre logo y texto */
+}}
+
+.footer-img {{
+    height: 50px;   /* tamaño del logo (ajustable) */
+    opacity: 0.9;
+}}
+
+.footer-text {{
+    font-size: 18px;
+    color: #666;
+}}
+</style>
+
+<div class="app-footer">
+    <div class="footer-inner">
+        {f'<img src="data:image/png;base64,{footer_logo_b64}" class="footer-img">' if footer_logo_b64 else ""}
+        <div class="footer-text">
+            Desarrollado por <strong>Foxbyte</strong>  <strong>2025</strong>
+        </div>
+    </div>
+</div>
+"""
+
+st.markdown(footer_html, unsafe_allow_html=True)
+
