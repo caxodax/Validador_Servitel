@@ -34,7 +34,7 @@ column_order:
   - "* TIPO DE CLIENTE"
   - "PAIS"
   - "ESTADO"
-  - "MUNICIPIO"
+  - "CIUDAD"
   - "MUNICIPIO"
   - "PARROQUIA"
   - "SECTOR"
