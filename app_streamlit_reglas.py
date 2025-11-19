@@ -108,18 +108,22 @@ with col_center:
             servitel_logo = candidates[0]
 
     if servitel_logo is not None:
-        st.image(str(servitel_logo), use_column_width=True)
+        st.markdown(
+            f"""
+            <div style="display:flex; justify-content:center;">
+                <img src="data:image/png;base64,{base64.b64encode(open(servitel_logo, "rb").read()).decode()}"
+                    style="width:240px;"/>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
 
     # Título centrado debajo del logo
     st.markdown(
-        "<h1 style='text-align:center; margin-bottom: 0;'>Validador MAESTRO</h1>",
+        "<h1 style='text-align:center; margin-bottom: 0;'>Sistema interno de validación de contratos</h1>",
         unsafe_allow_html=True,
     )
-    st.markdown(
-        "<p style='text-align:center; color:#777; margin-top: 0;'>Sistema interno de validación de contratos</p>",
-        unsafe_allow_html=True,
-    )
-
+    
 
 # =================== LECTURA INTELIGENTE DE ENCABEZADOS ===================
 HEADER_ROW_INDEX = 1  # segunda fila (0-based)
