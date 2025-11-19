@@ -1299,3 +1299,19 @@ footer_html = f"""
 
 st.markdown(footer_html, unsafe_allow_html=True)
 
+# Ocultar ícono de GitHub de la barra superior de Streamlit
+st.markdown(
+    """
+    <style>
+    /* Oculta el botón de GitHub en la barra superior */
+    button[kind="header"] svg[data-testid="stIconGithub"] {
+        display: none !important;
+    }
+    /* Opcional: también oculta el texto si apareciera */
+    a[href*="github.com"] {
+        text-decoration: none;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
