@@ -229,23 +229,26 @@ def build_column_config(df: pd.DataFrame):
 def highlight_column_list(columns, diff_df):
     """
     Devuelve una lista con:
-    - 🔴 emoji de alerta
+    - 🔴 emoji de alerta para columnas en diff_df
     - Texto en negrita
     - Fondo rojo suave para columnas incorrectas
-    - Formato: índice + nombre de columna
+    - Formato: LETRA_EXCEL: nombre de columna (ej: AF: ESTADO)
     """
     bad_positions = set(diff_df["posición"].tolist())
     styled = []
 
     for i, col in enumerate(columns):
+        letra = idx_to_excel_col(i)  # convierte 0,1,2... -> A,B,C...
+        label = f"{letra}: {col}"
+
         if i in bad_positions:
             styled.append(
                 f"<span style='background-color:#ffcccc; padding:3px 6px; border-radius:4px;'>"
-                f"🔴 <b>{i}: {col}</b>"
+                f"🔴 <b>{label}</b>"
                 f"</span>"
             )
         else:
-            styled.append(f"{i}: {col}")
+            styled.append(label)
 
     return styled
 
@@ -807,6 +810,19 @@ def build_error_mask_by_position(df: pd.DataFrame, errores: pd.DataFrame):
                     mask.iat[fila, j] = str(r.get("severity", "error"))
     return mask
 
+def idx_to_excel_col(idx: int) -> str:
+    """
+    Convierte un índice 0-based (0=A, 1=B, ...) en letra de columna Excel (A, B, ..., AA, AB, ...).
+    """
+    if pd.isna(idx):
+        return ""
+    n = int(idx) + 1  # pasamos a 1-based
+    result = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        result = chr(65 + r) + result
+    return result
+
 def style_error_cells_ui(df: pd.DataFrame, errores: pd.DataFrame):
     # Creamos una copia con columnas únicas SOLO para la UI
     disp = ui_df_with_unique_columns(df)
@@ -1029,22 +1045,32 @@ if archivo:
 
             if not ok_structure:
                 st.error("❌ Las columnas NO coinciden exactamente con el formato esperado.")
+                st.warning(f"Revisa la hoja **'{MAESTRO_SHEET}'** del archivo subido.")
+
                 with st.expander("Ver detalle de columnas"):
-                    # Primero: diferencias puntuales
+                    # --- Tabla resumida de diferencias ---
                     if not diff_df.empty:
+                        diff_view = diff_df.copy()
+
+                        # Añadir letra de columna Excel
+                        diff_view["columna_excel"] = diff_view["posición"].apply(idx_to_excel_col)
+
+                        # Reordenar y eliminar columnas *_norm que no necesitas
+                        diff_view = diff_view[["columna_excel", "posición", "esperado", "recibido"]]
+
                         st.write("Diferencias por posición (solo donde NO coinciden):")
-                        st.dataframe(diff_df, use_container_width=True)
+                        st.dataframe(diff_view, use_container_width=True)
                         st.markdown("---")
 
-                    # Luego: listas completas
+                    # --- Listado completo, con letras y resaltando columnas problemáticas ---
                         st.write("Listado completo de columnas esperadas:")
                         st.markdown("<br>".join(highlight_column_list(expected_cols, diff_df)), unsafe_allow_html=True)
 
                         st.write("Listado completo de columnas recibidas:")
                         st.markdown("<br>".join(highlight_column_list(received_cols, diff_df)), unsafe_allow_html=True)
 
+                        st.stop()
 
-                st.stop()
             else:
                 st.success("✅ Estructura OK (columnas y orden coherentes).")
 
@@ -1059,21 +1085,22 @@ if archivo:
 
         # ---- Errores ----
         if not errores.empty:
+            # Indicar la hoja donde se están encontrando los errores
+            st.info(f"Incidencias detectadas en la hoja de Excel: **'{MAESTRO_SHEET}'**")
+
+            # Añadir columna con letra de columna Excel para que el usuario lo entienda mejor
+            errores_mostrar = errores.copy()
+            if "col_idx" in errores_mostrar.columns:
+                errores_mostrar["columna_excel"] = errores_mostrar["col_idx"].apply(idx_to_excel_col)
+
             st.warning(f"⚠️ Se encontraron {len(errores)} incidencias.")
-            st.dataframe(errores, use_container_width=True)
+            st.dataframe(errores_mostrar, use_container_width=True)
 
-            # ERRORES.xlsx (con borde y RELLENO rojo claro)
-            st.download_button(
-                "⬇️ Descargar ERRORES.xlsx",
-                write_excel_with_errors(st.session_state["current_df"], errores, rules_pkg, title_for_unnamed="INFORMACION DEL ABONADO"),
-                "ERRORES.xlsx",
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
 
-            # ============== EDITOR DE INCIDENCIAS (CELDA POR CELDA) ==============
+           # ============== EDITOR DE INCIDENCIAS (CELDA POR CELDA) ==============
             st.markdown("## Editor de incidencias (por fila/columna)")
 
-            # Solo filas con col_idx válido (podemos ubicar la celda exacta)
+            # Solo filas con col_idx válido
             if "col_idx" in errores.columns:
                 errores_editables = errores.dropna(subset=["col_idx"]).copy()
             else:
@@ -1084,6 +1111,9 @@ if archivo:
             else:
                 errores_editables["fila"] = errores_editables["fila"].astype(int)
                 errores_editables["col_idx"] = errores_editables["col_idx"].astype(int)
+
+                # Convertir a letra de Excel
+                errores_editables["columna_excel"] = errores_editables["col_idx"].apply(idx_to_excel_col)
 
                 def severity_icon(sev: str) -> str:
                     sev = str(sev).lower()
@@ -1097,21 +1127,29 @@ if archivo:
 
                 errores_editables["estado"] = errores_editables["severity"].map(severity_icon)
 
-
-                # valor_actual desde el DF
+                # Valores actuales desde DF vivo
                 valores_actuales = []
                 for _, r in errores_editables.iterrows():
                     fila_i = int(r["fila"])
                     col_i = int(r["col_idx"])
-                    val = None
-                    if 0 <= fila_i < st.session_state["current_df"].shape[0] and 0 <= col_i < st.session_state["current_df"].shape[1]:
-                        val = st.session_state["current_df"].iat[fila_i, col_i]
+                    val = st.session_state["current_df"].iat[fila_i, col_i]
                     valores_actuales.append(val)
 
                 errores_editables["valor_actual"] = valores_actuales
                 errores_editables["nuevo_valor"] = errores_editables["valor_actual"]
 
-                editor_cols = ["estado", "fila", "columna", "col_idx", "valor_actual", "detalle", "severity", "nuevo_valor"]
+                # Ahora incluimos la letra de Excel en la tabla
+                editor_cols = [
+                    "estado",
+                    "fila",
+                    "columna",
+                    "columna_excel",   # ← NUEVA COLUMNA
+                    "col_idx",
+                    "valor_actual",
+                    "detalle",
+                    "severity",
+                    "nuevo_valor"
+                ]
                 editor_view = errores_editables[editor_cols]
 
                 edited_issues = st.data_editor(
@@ -1122,8 +1160,9 @@ if archivo:
                     column_config={
                         "estado": st.column_config.TextColumn("Estado", disabled=True),
                         "fila": st.column_config.NumberColumn("Fila DF", disabled=True),
-                        "columna": st.column_config.TextColumn("Columna", disabled=True),
-                        "col_idx": st.column_config.NumberColumn("Idx Columna", disabled=True),
+                        "columna": st.column_config.TextColumn("Nombre columna", disabled=True),
+                        "columna_excel": st.column_config.TextColumn("Columna (Excel)", disabled=True),
+                        "col_idx": st.column_config.NumberColumn("Idx interno", disabled=True),
                         "valor_actual": st.column_config.TextColumn("Valor actual", disabled=True),
                         "detalle": st.column_config.TextColumn("Detalle", disabled=True),
                         "severity": st.column_config.TextColumn("Severidad", disabled=True),
