@@ -19,6 +19,7 @@ EMAIL_POS    = 7           # col 8 (1-based) -> *E-MAIL*
 # FECHAS por POSICIÓN 0-based (obligatorias, dd/mm/yyyy)
 DATE_POSITIONS = [12, 13, 14, 15]
 
+# ----- Columnas opcionales -----
 OPTIONAL_COLUMNS = {
     "ZONA",
     "TIPO CALLE",
@@ -32,6 +33,33 @@ OPTIONAL_COLUMNS = {
     "LATITUD",
     "LONGITUD",
 }
+# ----- Columnas deben ser entero -----
+INT_COLUMNS = [
+    "* CODIGO CONTRATO",
+    "* N. DOCUMENTO",
+    "* DURACION (MESES)",
+    "* DIA COBRO",
+    "* DIA CORTE",
+    "PENALIDAD",
+    "ORDEN RUTA",
+    "NUMERO DE CASA",
+    "NUMERO DE CALLE",
+    "PRECIO DE TV ANALOGA",
+    "PRECIO TV ADICIONALES",
+    "DEUDA TV",
+    "PRECIO DE INTERNET",
+    "DEUDA INTERNET",
+    "PRECIO DE CATV",
+    "DEUDA CATV",
+    "PRECIO DE IPTV",
+    "DEUDA IPTV",
+    "PRECIO DE TELEFONIA",
+    "DEUDA TELEFONIA",
+    "PRECIO DE CAJA DIGITAL",
+    "DEUDA CAJA DIGITAL",
+    "VALOR"
+]
+
 
 # ----- Dominios de e-mail permitidos -----
 ALLOWED_DOMAINS = [
@@ -253,6 +281,18 @@ def highlight_column_list(columns, diff_df):
     return styled
 
 
+# ---------- Convertir columnas decimal a entero ----------
+def convert_int_columns(df: pd.DataFrame, int_cols: list[str]) -> pd.DataFrame:
+    df2 = df.copy()
+    for col in int_cols:
+        if col in df2.columns:
+            df2[col] = (
+                pd.to_numeric(df2[col], errors="coerce")
+                .fillna("")  # si está vacío, lo dejamos vacío
+            )
+            # quitar .0 si es entero
+            df2[col] = df2[col].apply(lambda x: int(x) if isinstance(x, float) and x.is_integer() else x)
+    return df2
 # ---------- Columnas duplicadas: helpers ----------
 def make_unique_labels(labels):
     seen = {}
@@ -1004,6 +1044,7 @@ if archivo:
 
         df_fixed = normalize_vlan(df_fixed)
         df_fixed, corrections_df, info_email_errors = apply_email_autocorrect(df_fixed, EMAIL_POS, enable_autocorrect)
+        df_fixed = convert_int_columns(df_fixed, INT_COLUMNS)
 
         st.session_state["current_df"] = df_fixed.copy()
         st.session_state["edited_df"]  = None
@@ -1033,7 +1074,10 @@ if archivo:
 
         # --- VISTA PREVIA con sombreado ---
         st.subheader("Vista previa (errores=rojo, avisos=amarillo, info=verde)")
-        df_preview = format_dates_for_display(st.session_state["current_df"].head(20), rules_pkg)
+        df_preview = convert_int_columns(
+                        format_dates_for_display(st.session_state["current_df"].head(20), rules_pkg),
+                        INT_COLUMNS
+                        )        
         st.dataframe(style_error_cells_ui(df_preview, errores), use_container_width=True)
 
         # Estructura (compara con nombres REALES pero normalizados para pequeños detalles)
@@ -1212,7 +1256,7 @@ if archivo:
                 df2 = digits_only_column(df2, DOC_NUM_POS)
                 if enable_autocorrect:
                     df2, _, _ = apply_email_autocorrect(df2, EMAIL_POS, True)
-                st.session_state["current_df"] = df2
+                df2 = convert_int_columns(df2, INT_COLUMNS)
                 st.session_state["edited_df"] = None  # editor se recalculará
 
                 # Recalcular errores con el DF actualizado
@@ -1230,7 +1274,7 @@ if archivo:
 
                 if errs2.empty:
                     st.success("✅ Sin errores. Puedes descargar el MAESTRO corregido:")
-                    df_export = pick_live_df().copy()
+                    df_export = convert_int_columns(pick_live_df().copy(), INT_COLUMNS)
                     if enable_autocorrect:
                         df_export, _, _ = apply_email_autocorrect(df_export, EMAIL_POS, True)
                     st.download_button(
