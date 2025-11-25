@@ -1,0 +1,7 @@
+[theme]
+base = "light"                         # fuerza tema claro
+primaryColor = "#00a651"              # verde Servitel (puedes cambiarlo)
+backgroundColor = "#ffffff"           # fondo blanco
+secondaryBackgroundColor = "#f5f5f5"  # recuadros, paneles, etc.
+textColor = "#111111"                 # texto casi negro
+font = "sans serif"
