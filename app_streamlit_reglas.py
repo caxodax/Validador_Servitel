@@ -33,6 +33,12 @@ OPTIONAL_COLUMNS = {
     "LATITUD",
     "LONGITUD",
 }
+
+SEVERITY_MAP_ES = {
+    "error": "Error",
+    "warn": "Aviso",
+    "info": "Información"
+}
 # ----- Columnas deben ser entero -----
 INT_COLUMNS = [
     "* CODIGO CONTRATO",
@@ -866,6 +872,8 @@ def idx_to_excel_col(idx: int) -> str:
 def style_error_cells_ui(df: pd.DataFrame, errores: pd.DataFrame):
     # Creamos una copia con columnas únicas SOLO para la UI
     disp = ui_df_with_unique_columns(df)
+    disp.index = disp.index + 1
+
     pos_mask = build_error_mask_by_position(df, errores)
 
     def apply_colors(row):
@@ -1020,41 +1028,59 @@ if "current_df" not in st.session_state:
     st.session_state["current_df"] = None
 if "edited_df" not in st.session_state:
     st.session_state["edited_df"] = None
+if "file_id" not in st.session_state:
+    st.session_state["file_id"] = None
+
+
 
 if archivo:
     try:
-        # --- SIEMPRE REINICIAR AL CARGAR UN ARCHIVO NUEVO ---
-        st.session_state["current_df"] = None
-        st.session_state["edited_df"] = None
+        # Identificador simple del archivo (nombre + tamaño)
+        file_id = f"{archivo.name}_{archivo.size}"
 
-        # --- LECTURA INTELIGENTE DESDE CERO ---
-        df_raw = smart_read_maestro(archivo)
+        # Si es un archivo nuevo, reiniciamos; si es el mismo, conservamos DF vivo
+        if st.session_state["file_id"] != file_id:
+            st.session_state["file_id"] = file_id
+            st.session_state["current_df"] = None
+            st.session_state["edited_df"] = None
 
-        # Normalización base
-        df_norm  = apply_non_destructive_normalization(df_raw)
-        df_fixed = apply_auto_fixes(df_norm, rules_pkg)
-        df_fixed = force_uppercase_first_cols(df_fixed, n=UPPERCASE_N)
-        df_fixed, tipo_errs_all = infer_tipo_documento_from_docnum(df_fixed, TIPO_DOC_POS, DOC_NUM_POS)
-        df_fixed = normalize_text_apostrophe(df_fixed)
+        # --- LECTURA INTELIGENTE DESDE CERO SOLO SI AÚN NO HAY DF VIVO ---
+        if st.session_state["current_df"] is None:
+            df_raw = smart_read_maestro(archivo)
 
-        df_fixed = digits_only_column(df_fixed, DOC_NUM_POS)
+            # Normalización base
+            df_norm  = apply_non_destructive_normalization(df_raw)
+            df_fixed = apply_auto_fixes(df_norm, rules_pkg)
+            df_fixed = force_uppercase_first_cols(df_fixed, n=UPPERCASE_N)
+            df_fixed, tipo_errs_all = infer_tipo_documento_from_docnum(df_fixed, TIPO_DOC_POS, DOC_NUM_POS)
+            df_fixed = normalize_text_apostrophe(df_fixed)
 
-        if "MAC" in df_fixed.columns:
-            df_fixed["MAC"] = df_fixed["MAC"].map(clean_mac)
+            df_fixed = digits_only_column(df_fixed, DOC_NUM_POS)
 
-        df_fixed = normalize_vlan(df_fixed)
-        df_fixed, corrections_df, info_email_errors = apply_email_autocorrect(df_fixed, EMAIL_POS, enable_autocorrect)
-        df_fixed = convert_int_columns(df_fixed, INT_COLUMNS)
+            if "MAC" in df_fixed.columns:
+                df_fixed["MAC"] = df_fixed["MAC"].map(clean_mac)
 
-        st.session_state["current_df"] = df_fixed.copy()
-        st.session_state["edited_df"]  = None
+            df_fixed = normalize_vlan(df_fixed)
+            df_fixed, corrections_df, info_email_errors = apply_email_autocorrect(df_fixed, EMAIL_POS, enable_autocorrect)
+            df_fixed = convert_int_columns(df_fixed, INT_COLUMNS)
 
-        # ---------------- VALIDACIÓN ----------------
-        df_valid = df_fixed.copy()
+            st.session_state["current_df"] = df_fixed.copy()
+            st.session_state["edited_df"]  = None
+        else:
+            # Si ya tenemos DF vivo, seguimos usando ese
+            df_fixed = pick_live_df().copy()
+            # Y no recalculamos tipo_errs_all ni corrections_df aquí
+            tipo_errs_all = pd.DataFrame(columns=["fila","columna","col_idx","regla","detalle","severity"])
+            corrections_df = pd.DataFrame()
+            info_email_errors = pd.DataFrame(columns=["fila","columna","col_idx","regla","detalle","severity"])
+
+        # ---------------- VALIDACIÓN SIEMPRE SOBRE EL DF VIVO ----------------
+        df_valid = pick_live_df().copy()
         df_valid.index = range(len(df_valid))
 
         errores_yaml = validate_dataframe(df_valid, rules_pkg)
         errores_pos  = validate_position_rules(df_valid)
+
 
         tipo_errs = tipo_errs_all.copy()
         if not tipo_errs.empty:
@@ -1073,11 +1099,11 @@ if archivo:
         # =================== SIGUE TODO LO DEMÁS ===================
 
         # --- VISTA PREVIA con sombreado ---
-        st.subheader("Vista previa (errores=rojo, avisos=amarillo, info=verde)")
+        st.subheader("Vista previa Informacion (Error=🔴, Aviso=🟡, Info=🟢)")
         df_preview = convert_int_columns(
-                        format_dates_for_display(st.session_state["current_df"].head(20), rules_pkg),
-                        INT_COLUMNS
-                        )        
+            format_dates_for_display(pick_live_df().head(20), rules_pkg),
+            INT_COLUMNS
+        )     
         st.dataframe(style_error_cells_ui(df_preview, errores), use_container_width=True)
 
         # Estructura (compara con nombres REALES pero normalizados para pequeños detalles)
@@ -1130,18 +1156,43 @@ if archivo:
         # ---- Errores ----
         if not errores.empty:
             # Indicar la hoja donde se están encontrando los errores
+            st.subheader("Vista Previa Incidencias")
             st.info(f"Incidencias detectadas en la hoja de Excel: **'{MAESTRO_SHEET}'**")
 
+                       # Añadir columna con letra de columna Excel para que el usuario lo entienda mejor
             # Añadir columna con letra de columna Excel para que el usuario lo entienda mejor
             errores_mostrar = errores.copy()
+            errores_mostrar["Importancia"] = errores_mostrar["severity"].str.lower().map(SEVERITY_MAP_ES)
             if "col_idx" in errores_mostrar.columns:
                 errores_mostrar["columna_excel"] = errores_mostrar["col_idx"].apply(idx_to_excel_col)
+           
+
+                # Reordenar para que sea coordenada fácil: Columna (Excel) + Fila
+                cols = list(errores_mostrar.columns)
+                new_order = []
+                if "columna_excel" in cols:
+                    new_order.append("columna_excel")  # primero la columna Excel
+                if "fila" in cols:
+                    new_order.append("fila")           # luego la fila → coordenada tipo G | 15
+                # el resto
+                new_order += [c for c in cols if c not in new_order]
+                errores_mostrar = errores_mostrar[new_order]
+            
+            errores_mostrar.index = errores_mostrar.index + 1
+
+            # 🔒 Ocultar columnas internas en la vista (pero NO borrarlas del DF original)
+            cols_visibles = [
+                c for c in errores_mostrar.columns
+                if c not in ("col_idx", "idxinterno", "severity")  # aquí puedes añadir más internas si quieres
+            ]
 
             st.warning(f"⚠️ Se encontraron {len(errores)} incidencias.")
-            st.dataframe(errores_mostrar, use_container_width=True)
+            st.dataframe(errores_mostrar[cols_visibles], use_container_width=True)
 
 
-           # ============== EDITOR DE INCIDENCIAS (CELDA POR CELDA) ==============
+
+
+            # ============== EDITOR DE INCIDENCIAS (CELDA POR CELDA) ==============
             st.markdown("## Editor de incidencias (por fila/columna)")
 
             # Solo filas con col_idx válido
@@ -1158,6 +1209,7 @@ if archivo:
 
                 # Convertir a letra de Excel
                 errores_editables["columna_excel"] = errores_editables["col_idx"].apply(idx_to_excel_col)
+                errores_editables["fila_excel"] = errores_editables["fila"] + 1
 
                 def severity_icon(sev: str) -> str:
                     sev = str(sev).lower()
@@ -1182,49 +1234,78 @@ if archivo:
                 errores_editables["valor_actual"] = valores_actuales
                 errores_editables["nuevo_valor"] = errores_editables["valor_actual"]
 
-                # Ahora incluimos la letra de Excel en la tabla
+                # Columnas que muestra el editor
                 editor_cols = [
                     "estado",
-                    "fila",
+                    "columna_excel",
+                    "fila_excel",   # 👈 visible al usuario
+                    "fila",         # 👈 interna (0-based)
                     "columna",
-                    "columna_excel",   # ← NUEVA COLUMNA
-                    "col_idx",
+                    "col_idx",      # 👈 interna
                     "valor_actual",
                     "detalle",
                     "severity",
-                    "nuevo_valor"
+                    "nuevo_valor",
                 ]
-                editor_view = errores_editables[editor_cols]
+
+                editor_view = errores_editables[editor_cols].copy()
+                #  índice visible 1,2,3... en lugar de 0,1,2...
+                editor_view.index = editor_view.index + 1
+                st.session_state["editor_base"] = editor_view.copy()
+
+                # Solo estas columnas se muestran en la UI
+                visible_cols = [
+                    "estado",
+                    "columna_excel",
+                    "fila_excel",   # Fila 1,2,3...
+                    "columna",
+                    "valor_actual",
+                    "detalle",
+                    "severity",
+                    "nuevo_valor",
+                ]
 
                 edited_issues = st.data_editor(
                     editor_view,
                     use_container_width=True,
                     num_rows="fixed",
                     key="editor_issues",
+                    column_order=visible_cols,   # 👈 aquí ocultamos fila / col_idx internas
                     column_config={
                         "estado": st.column_config.TextColumn("Estado", disabled=True),
-                        "fila": st.column_config.NumberColumn("Fila DF", disabled=True),
-                        "columna": st.column_config.TextColumn("Nombre columna", disabled=True),
                         "columna_excel": st.column_config.TextColumn("Columna (Excel)", disabled=True),
-                        "col_idx": st.column_config.NumberColumn("Idx interno", disabled=True),
+                        "fila_excel": st.column_config.NumberColumn("Fila", disabled=True),
+                        "columna": st.column_config.TextColumn("Nombre columna", disabled=True),
                         "valor_actual": st.column_config.TextColumn("Valor actual", disabled=True),
                         "detalle": st.column_config.TextColumn("Detalle", disabled=True),
                         "severity": st.column_config.TextColumn("Severidad", disabled=True),
-                        "nuevo_valor": st.column_config.TextColumn("Nuevo valor"),
-                    }
+                        "nuevo_valor": st.column_config.TextColumn("Nuevo valor", disabled=False),
+                    },
                 )
 
-                # Aplicar cambios al DF vivo
+                # === BLINDAJE: restaurar todas las columnas excepto 'nuevo_valor' ===
+                base_view = st.session_state.get("editor_base", editor_view)
+                safe_edited = edited_issues.copy()
+
+                for col in editor_cols:
+                    if col != "nuevo_valor":
+                        # Cualquier cambio manual en estas columnas se ignora
+                        safe_edited[col] = base_view[col]
+
+                # Aplicar cambios solo de 'nuevo_valor' al DF vivo
                 df_editado = st.session_state["current_df"].copy()
-                for _, row in edited_issues.iterrows():
-                    fila_i = int(row["fila"])
-                    col_i = int(row["col_idx"])
+
+                for idx, row in safe_edited.iterrows():
+                    fila_i = int(base_view.loc[idx, "fila"])
+                    col_i = int(base_view.loc[idx, "col_idx"])
                     new_val = row["nuevo_valor"]
+
                     if 0 <= fila_i < df_editado.shape[0] and 0 <= col_i < df_editado.shape[1]:
                         df_editado.iat[fila_i, col_i] = new_val
 
                 st.session_state["current_df"] = df_editado.copy()
                 st.session_state["edited_df"] = df_editado.copy()
+
 
             # Descarga "de todos modos" ANTES de revalidar
             st.info("¿Deseas descargar el MAESTRO corregido aunque aún haya incidencias?")
@@ -1241,7 +1322,7 @@ if archivo:
                     key="download_anytime_btn"
                 )
 
-            # Revalidar (respeta edición)
+                       # Revalidar (respeta edición)
             st.markdown("---")
             if st.button("Revalidar"):
                 df2 = pick_live_df().copy()
@@ -1257,34 +1338,14 @@ if archivo:
                 if enable_autocorrect:
                     df2, _, _ = apply_email_autocorrect(df2, EMAIL_POS, True)
                 df2 = convert_int_columns(df2, INT_COLUMNS)
-                st.session_state["edited_df"] = None  # editor se recalculará
 
-                # Recalcular errores con el DF actualizado
-                df2_valid = df2.copy()
-                df2_valid.index = range(len(df2_valid))
-                e_yaml2 = validate_dataframe(df2_valid, rules_pkg)
-                e_pos2 = validate_position_rules(df2_valid)
-                frames2 = []
-                for e in (e_yaml2, e_pos2):
-                    if e is not None and not e.empty:
-                        if "severity" not in e.columns:
-                            e = e.copy(); e["severity"] = "error"
-                        frames2.append(e)
-                errs2 = pd.concat(frames2, ignore_index=True) if frames2 else pd.DataFrame(columns=["fila","columna","col_idx","regla","detalle","severity"])
+                # Guardar como DF vivo y limpiar editor
+                st.session_state["current_df"] = df2.copy()
+                st.session_state["edited_df"] = None
 
-                if errs2.empty:
-                    st.success("✅ Sin errores. Puedes descargar el MAESTRO corregido:")
-                    df_export = convert_int_columns(pick_live_df().copy(), INT_COLUMNS)
-                    if enable_autocorrect:
-                        df_export, _, _ = apply_email_autocorrect(df_export, EMAIL_POS, True)
-                    st.download_button(
-                        "⬇️ Descargar Excel validado",
-                        write_excel_validated(df_export, rules_pkg, title_for_unnamed="INFORMACION DEL ABONADO"),
-                        "MAESTRO_corregido.xlsx",
-                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
-                else:
-                    st.warning(f"Aún hay {len(errs2)} errores. Corrige y vuelve a revalidar.")
+                # Relanzar la app para que vista previa + incidencias se regeneren con df2
+                st.rerun()
+
 
         else:
             st.success("✅ Sin errores desde la fila 1.")
