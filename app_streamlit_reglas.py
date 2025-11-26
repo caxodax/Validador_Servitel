@@ -899,15 +899,23 @@ def idx_to_excel_col(idx: int) -> str:
 def style_error_cells_ui(df: pd.DataFrame, errores: pd.DataFrame):
     # Creamos una copia con columnas únicas SOLO para la UI
     disp = ui_df_with_unique_columns(df)
+    # Índice visible para el usuario: 1, 2, 3...
     disp.index = disp.index + 1
 
+    # Máscara de errores sigue 0-based (coincide con el DF original)
     pos_mask = build_error_mask_by_position(df, errores)
 
     def apply_colors(row):
-        i = row.name
+        i_display = row.name      # 1, 2, 3, ...
+        i0 = int(i_display) - 1   # índice real 0-based
+
         styles = []
         for j in range(len(row)):
-            sev = pos_mask.iat[i, j] if i < pos_mask.shape[0] else ""
+            if 0 <= i0 < pos_mask.shape[0]:
+                sev = pos_mask.iat[i0, j]
+            else:
+                sev = ""
+
             if sev == "info":
                 styles.append("background-color: #e7f7e7")
             elif sev == "warn":
@@ -919,6 +927,7 @@ def style_error_cells_ui(df: pd.DataFrame, errores: pd.DataFrame):
         return styles
 
     return disp.style.apply(apply_colors, axis=1)
+
 
 # ---------- Exportar Excel ----------
 def _blank_unnamed_headers(ws, header_row_index: int, col_names):
