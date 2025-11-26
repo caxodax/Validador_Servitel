@@ -365,14 +365,26 @@ def digits_only_column(df: pd.DataFrame, pos: int) -> pd.DataFrame:
     return df2
 
 def clean_mac(value: str) -> str:
-    """Limpia la MAC quitando separadores y dejando solo hexadecimales."""
+    """
+    Limpia y formatea la MAC:
+    - Mantiene solo caracteres hexadecimales
+    - Convierte a MAYÚSCULAS
+    - Inserta ':' cada 2 caracteres → XX:XX:XX:XX:XX:XX
+    """
     if pd.isna(value):
         return ""
-    s = str(value).strip()
-    # eliminar todos los separadores y símbolos comunes
-    s = re.sub(r'[^0-9A-Fa-f]', '', s)
-    # devolver limpio pero sin validar aún
-    return s.upper()
+
+    # Solo hex en mayúsculas
+    s = re.sub(r'[^0-9A-Fa-f]', '', str(value)).upper()
+
+    if s == "":
+        return ""
+
+    # Partir en grupos de 2 caracteres
+    parts = [s[i:i+2] for i in range(0, len(s), 2)]
+    return ":".join(parts)
+
+
 
 def normalize_vlan(df: pd.DataFrame) -> pd.DataFrame:
     if "VLAN" not in df.columns:
@@ -596,7 +608,9 @@ IP_COL_NAME = "IP"
 IP_REGEX = re.compile(r'^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])$')
 PHONE_COL_NAME = "TELEFONOS"  # columna de teléfonos
 MAC_COL_NAME = "MAC"
-MAC_REGEX = re.compile(r'^[0-9A-Fa-f]{12}$')  # 12 caracteres hexadecimales corridos
+# Formato MAC estándar: XX:XX:XX:XX:XX:XX (hexadecimal en mayúsculas)
+MAC_REGEX = re.compile(r'^([0-9A-F]{2}:){5}[0-9A-F]{2}$')
+
 
 def validate_position_rules(df: pd.DataFrame) -> pd.DataFrame:
     errs = []
@@ -697,17 +711,29 @@ def validate_position_rules(df: pd.DataFrame) -> pd.DataFrame:
                 )
 
     # MAC: 12 caracteres hexadecimales corridos, sin separadores
+    # MAC: obligatoria, solo hex y formato XX:XX:XX:XX:XX:XX
     if MAC_COL_NAME in df.columns:
         c = MAC_COL_NAME
         col_idx = df.columns.get_loc(c)
 
         for i, v in df[c].items():
-            s = "" if pd.isna(v) else str(v).strip()
+            s = "" if pd.isna(v) else str(v).strip().upper()
 
+            # ❌ No puede estar vacía
             if s == "":
-                continue  # No obligatorio
+                errs.append(
+                    (
+                        i,
+                        c,
+                        col_idx,
+                        "mac_vacia",
+                        "MAC es obligatoria y no puede estar vacía.",
+                        "error",
+                    )
+                )
+                continue
 
-            # después de limpieza debe ser 12 hexadecimales
+            # ✅ Validar formato: XX:XX:XX:XX:XX:XX solo hex en mayúsculas
             if not MAC_REGEX.fullmatch(s):
                 errs.append(
                     (
@@ -715,10 +741,11 @@ def validate_position_rules(df: pd.DataFrame) -> pd.DataFrame:
                         c,
                         col_idx,
                         "mac_invalida",
-                        "MAC inválida: debe tener exactamente 12 caracteres hexadecimales sin símbolos. Ej: 001A2B3C4D5E",
+                        "MAC inválida: use solo hexadecimales en mayúscula y formato XX:XX:XX:XX:XX:XX (ej. 00:AF:2B:3C:4D:5E).",
                         "error",
                     )
                 )
+
 
     # VLAN opcional pero si viene debe ser entera
     if "VLAN" in df.columns:
@@ -1299,6 +1326,11 @@ if archivo:
                     fila_i = int(base_view.loc[idx, "fila"])
                     col_i = int(base_view.loc[idx, "col_idx"])
                     new_val = row["nuevo_valor"]
+
+                    # Si es la columna MAC, normalizamos (hex + mayúscula + ':')
+                    col_name = df_editado.columns[col_i]
+                    if str(col_name).strip().upper() == "MAC":
+                        new_val = clean_mac(new_val)
 
                     if 0 <= fila_i < df_editado.shape[0] and 0 <= col_i < df_editado.shape[1]:
                         df_editado.iat[fila_i, col_i] = new_val
