@@ -163,32 +163,60 @@ with col_center:
 HEADER_ROW_INDEX = 1  # segunda fila (0-based)
 
 def smart_read_maestro(file) -> pd.DataFrame:
-    """Lee la hoja MAESTRO y detecta si la primera fila es un título/merge.
-    Si lo es, usa la fila 2 como encabezado y devuelve solo las filas de datos.
     """
-    df0 = pd.read_excel(file, sheet_name=MAESTRO_SHEET, header=None, engine="openpyxl")
+    Lector inteligente compatible con TODOS los archivos:
+    1) Si encuentra la fila que contiene '* CODIGO CONTRATO' → usa esa como encabezado.
+    2) Si NO la encuentra → usa la heurística original (many_unnamed / título / fila 2).
+    Esto garantiza compatibilidad con archivos antiguos y con los nuevos.
+    """
+    # Leer hoja MAESTRO sin encabezado
+    df0 = pd.read_excel(
+        file, 
+        sheet_name=MAESTRO_SHEET, 
+        header=None, 
+        engine="openpyxl"
+    )
 
-    first_row = df0.iloc[0].astype(str)
-    many_unnamed = (first_row.str.startswith("Unnamed")).mean() > 0.5
-    has_title = first_row.str.contains("INFORMACION", case=False, na=False).any()
+    # --- INTENTO 1: Buscar explícitamente la fila con '* CODIGO CONTRATO' ---
+    header_row = None
+    max_scan = min(12, len(df0))   # escanea primeras filas solamente
+    for i in range(max_scan):
+        row_str = df0.iloc[i].astype(str).str.strip()
+        if "* CODIGO CONTRATO" in row_str.values:
+            header_row = i
+            break
 
-    header_row = HEADER_ROW_INDEX if (many_unnamed or has_title) else 0
+    # --- INTENTO 2: Heurística original (si no se encontró encabezado claro) ---
+    if header_row is None:
+        first_row = df0.iloc[0].astype(str)
+        many_unnamed = (first_row.str.startswith("Unnamed")).mean() > 0.5
+        has_title = first_row.str.contains("INFORMACION", case=False, na=False).any()
 
-    # Heurística extra: si la fila 2 contiene "* CODIGO CONTRATO", usa fila 2
-    try:
-        row1 = df0.iloc[1].astype(str).str.strip()
-        if "* CODIGO CONTRATO" in row1.values:
-            header_row = HEADER_ROW_INDEX
-    except Exception:
-        pass
+        if many_unnamed or has_title:
+            header_row = HEADER_ROW_INDEX  # por defecto fila 1 (segunda)
+        else:
+            header_row = 0  # primera fila
 
+        # Reglas extra originales
+        try:
+            row1 = df0.iloc[1].astype(str).str.strip()
+            if "* CODIGO CONTRATO" in row1.values:
+                header_row = HEADER_ROW_INDEX
+        except Exception:
+            pass
+
+    # --- Construir encabezados y datos ---
     header = df0.iloc[header_row].astype(str).str.strip().tolist()
     df = df0.iloc[header_row + 1 : ].copy()
     df.columns = header
     df.reset_index(drop=True, inplace=True)
 
-    # Limpia posibles "Unnamed"
-    df.columns = [c if not str(c).lower().startswith("unnamed") else "" for c in df.columns]
+    # Limpiar nombres tipo 'Unnamed'
+    df.columns = [
+        c if not str(c).lower().startswith("unnamed") else "" 
+        for c in df.columns
+    ]
+
     return df
 
 # =================== CARGA DE REGLAS (estructura/fechas) ===================
@@ -336,17 +364,29 @@ def ensure_datetime_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 def format_dates_for_display(df: pd.DataFrame, rules_pkg):
-    """Solo para mostrar en la UI: dd/mm/yyyy."""
+    """
+    Solo para mostrar en la UI: dd/mm/yyyy.
+    Soporta columnas duplicadas usando SIEMPRE posición (iloc)
+    para evitar el error 'cannot assemble with duplicate keys'.
+    """
     out = df.copy()
-    for col in date_columns_from_rules(rules_pkg):
-        if col in out.columns:
-            s = pd.to_datetime(out[col], errors="coerce")
-            out[col] = s.dt.strftime("%d/%m/%Y")
+
+    # 1) Columnas de fecha definidas en las rules (por NOMBRE, pero aplicando por ÍNDICE)
+    date_cols = date_columns_from_rules(rules_pkg)
+    for col_name in date_cols:
+        if col_name in out.columns:
+            # puede haber columnas duplicadas con el mismo nombre
+            idxs = [j for j, name in enumerate(out.columns) if name == col_name]
+            for j in idxs:
+                serie = pd.to_datetime(out.iloc[:, j], errors="coerce")
+                out.iloc[:, j] = serie.dt.strftime("%d/%m/%Y")
+
+    # 2) Columnas de fecha definidas por POSICIÓN (DATE_POSITIONS)
     for pos in DATE_POSITIONS:
-        if pos < len(out.columns):
-            c = out.columns[pos]
-            s = pd.to_datetime(out[c], errors="coerce")
-            out[c] = s.dt.strftime("%d/%m/%Y")
+        if pos < out.shape[1]:
+            serie = pd.to_datetime(out.iloc[:, pos], errors="coerce")
+            out.iloc[:, pos] = serie.dt.strftime("%d/%m/%Y")
+
     return out
 
 # ---------- Transformaciones ----------
@@ -443,28 +483,85 @@ def normalize_text_apostrophe(df: pd.DataFrame) -> pd.DataFrame:
 DOC_PREFIX_MAP = {"J": "JURIDICO", "V": "CEDULA", "G": "GOBIERNO", "E": "EXTRANJERO"}
 
 def infer_tipo_documento_from_docnum(df: pd.DataFrame, tipo_pos: int, doc_pos: int):
+    """
+    Rellena la columna *TIPO DOCUMENTO* (posición tipo_pos) en función del contenido
+    de *N. DOCUMENTO* (posición doc_pos), usando el prefijo de la cédula/RIF.
+
+    Trabaja SIEMPRE por posición (.iat) para evitar problemas con columnas duplicadas.
+    Devuelve:
+      - df2: DataFrame con los tipos de documento inferidos
+      - errs_df: DataFrame de errores (fila, columna, col_idx, regla, detalle, severity)
+    """
     df2 = df.copy()
     errs = []
+
+    # Seguridad: si alguna posición se sale del rango, devolvemos sin tocar nada
     if tipo_pos >= len(df2.columns) or doc_pos >= len(df2.columns):
-        return df2, pd.DataFrame(columns=["fila","columna","col_idx","regla","detalle","severity"])
-    tipo_col = df2.columns[tipo_pos]
-    doc_col  = df2.columns[doc_pos]
-    for i in df2.index:
-        s = "" if pd.isna(df2.at[i, doc_col]) else str(df2.at[i, doc_col]).strip()
+        return df2, pd.DataFrame(
+            columns=["fila", "columna", "col_idx", "regla", "detalle", "severity"]
+        )
+
+    # Nombres "lógicos" solo para reportar en errores
+    tipo_col_name = df2.columns[tipo_pos]
+    doc_col_name = df2.columns[doc_pos]
+
+    # Recorremos por índice entero (0-based)
+    for i in range(len(df2)):
+        val = df2.iat[i, doc_pos]  # valor crudo de N. DOCUMENTO en esa fila
+
+        # Normalizamos a string
+        s = "" if pd.isna(val) else str(val).strip()
+
         if s == "":
-            errs.append((i, tipo_col, tipo_pos, "tipo_documento_desconocido", "N. DOCUMENTO vacío", "error")); continue
+            # Documento vacío -> no podemos inferir tipo
+            errs.append(
+                (
+                    i,
+                    tipo_col_name,
+                    tipo_pos,
+                    "tipo_documento_desconocido",
+                    f"{doc_col_name} vacío",
+                    "error",
+                )
+            )
+            continue
+
+        # Buscamos la primera letra en el documento
         m = re.search(r"[A-Za-z]", s)
         if not m:
-            df2.at[i, tipo_col] = "CEDULA"; continue
+            # Sin letras: asumimos CÉDULA (Venezolano)
+            df2.iat[i, tipo_pos] = "CEDULA"
+            continue
+
         pref = m.group(0).upper()
         mapped = DOC_PREFIX_MAP.get(pref)
+
         if mapped is None:
-            errs.append((i, tipo_col, tipo_pos, "tipo_documento_desconocido", f"Prefijo '{pref}' no reconocido", "error"))
+            # Prefijo no reconocido
+            errs.append(
+                (
+                    i,
+                    tipo_col_name,
+                    tipo_pos,
+                    "tipo_documento_desconocido",
+                    f"Prefijo '{pref}' no reconocido en {doc_col_name}",
+                    "error",
+                )
+            )
         else:
-            df2.at[i, tipo_col] = mapped
+            # Prefijo reconocido -> asignamos tipo
+            df2.iat[i, tipo_pos] = mapped
+
     if not errs:
-        return df2, pd.DataFrame(columns=["fila","columna","col_idx","regla","detalle","severity"])
-    return df2, pd.DataFrame(errs, columns=["fila","columna","col_idx","regla","detalle","severity"])
+        return df2, pd.DataFrame(
+            columns=["fila", "columna", "col_idx", "regla", "detalle", "severity"]
+        )
+
+    errs_df = pd.DataFrame(
+        errs, columns=["fila", "columna", "col_idx", "regla", "detalle", "severity"]
+    )
+    return df2, errs_df
+
 
 # ---------- E-mail: normalización + autocorrección ----------
 EMAIL_REGEX = re.compile(r'^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$')
@@ -497,12 +594,27 @@ def _insert_at_using_suffix_match(s: str) -> str | None:
             return f"{local}@{best_domain}"
     return None
 
-def autocorrect_email(value: str):
-    """Devuelve (new_value, corrected:bool, detail:str, valid:bool)."""
-    original = "" if pd.isna(value) else str(value)
+def autocorrect_email(value):
+    """
+    Devuelve (new_value, corrected:bool, detail:str, valid:bool).
+
+    Esta versión evita usar pd.isna(value) para no provocar
+    'ValueError: The truth value of a Series is ambiguous'
+    cuando el valor no es escalar.
+    """
+    # 1) Normalizamos SIEMPRE a string, sin usar pd.isna
+    if value is None:
+        original = ""
+    else:
+        try:
+            original = str(value)
+        except Exception:
+            original = ""
+
     s = _clean_email_text(original)
 
-    if s == "" or s.lower() in {"none", "nan", "null"}:
+    # 2) Consideramos nulos o vacíos: "", none, nan, null, <na>
+    if s == "" or s.lower() in {"none", "nan", "null", "<na>"}:
         return original, False, "", False
 
     # Sin '@': intento insertar por sufijo aproximado o por dominio pegado.
@@ -525,6 +637,7 @@ def autocorrect_email(value: str):
         s = parts[0] + "@" + "".join(parts[1:])
 
     if "@" not in s:
+        # No se pudo construir un correo válido
         return s, False, "", False
 
     local, domain = s.split("@", 1)
@@ -541,6 +654,7 @@ def autocorrect_email(value: str):
         domain = new_domain
         corrected = True
 
+    # Si ya está en la lista de permitidos
     if domain in ALLOWED_DOMAINS:
         final_email = f"{local}@{domain}"
         return final_email, corrected, detail, EMAIL_REGEX.fullmatch(final_email) is not None
@@ -564,6 +678,7 @@ def autocorrect_email(value: str):
     final_email = f"{local}@{domain}"
     valid = EMAIL_REGEX.fullmatch(final_email) is not None and (domain in ALLOWED_DOMAINS)
     return final_email, corrected, detail, valid
+
 
 def apply_email_autocorrect(df: pd.DataFrame, email_pos: int, enable: bool):
     corr_rows = []
@@ -612,49 +727,74 @@ MAC_COL_NAME = "MAC"
 MAC_REGEX = re.compile(r'^([0-9A-F]{2}:){5}[0-9A-F]{2}$')
 
 
+
 def validate_position_rules(df: pd.DataFrame) -> pd.DataFrame:
     errs = []
-    # Email obligatorio + dominio permitido
+
+    # ================== EMAIL OBLIGATORIO + DOMINIO PERMITIDO ==================
     if EMAIL_POS < len(df.columns):
-        c = df.columns[EMAIL_POS]
-        series = df[c].astype(str).str.strip()
+        c = df.columns[EMAIL_POS]  # solo para mostrar el nombre de la columna
+        # Usar SIEMPRE posición para evitar problemas con nombres duplicados
+        series = df.iloc[:, EMAIL_POS].astype(str).str.strip()
+
         for i, v in series.items():
             ok_regex = EMAIL_REGEX.fullmatch(v or "")
             ok_domain = False
+
             if ok_regex:
                 try:
                     domain = v.split("@", 1)[1].lower()
                     ok_domain = domain in ALLOWED_DOMAINS
                 except Exception:
                     ok_domain = False
-            if (v == "" or v.lower() in {"none","nan","null"}):
+
+            if (v == "" or v.lower() in {"none", "nan", "null"}):
                 errs.append((i, c, EMAIL_POS, "email_vacio", "Correo vacío", "error"))
             elif "@" not in v:
                 errs.append((i, c, EMAIL_POS, "email_sin_arroba", "Correo sin '@' o dominio", "error"))
             elif (not ok_regex) or (not ok_domain):
                 errs.append((i, c, EMAIL_POS, "email_invalido", "Correo inválido o dominio no permitido", "warn"))
 
-    # Fechas obligatorias
+    # ================== FECHAS OBLIGATORIAS (por POSICIÓN) ==================
     for pos in DATE_POSITIONS:
         if pos < len(df.columns):
             c = df.columns[pos]
-            s = pd.to_datetime(df[c], errors="coerce")
-            for i in df.index:
-                if pd.isna(s.loc[i]):
-                    errs.append((i, c, pos, "fecha_obligatoria", "Fecha vacía o inválida (dd/mm/yyyy)", "error"))
+            # IMPORTANTE: usar iloc para evitar DataFrames por columnas duplicadas
+            series = pd.to_datetime(df.iloc[:, pos], errors="coerce")
+            for i, val in series.items():
+                if pd.isna(val):
+                    errs.append(
+                        (
+                            i,
+                            c,
+                            pos,
+                            "fecha_obligatoria",
+                            "Fecha vacía o inválida (dd/mm/yyyy)",
+                            "error",
+                        )
+                    )
 
-    # IP válida (4 octetos 0–255) — si existe la columna "IP"
+    # ================== IP VÁLIDA ==================
     if IP_COL_NAME in df.columns:
         c = IP_COL_NAME
         col_idx = df.columns.get_loc(c)
         for i, v in df[c].items():
             if pd.isna(v) or str(v).strip() == "":
-                continue  # si quieres que sea obligatoria, cambia a error por vacío aquí
+                continue  # si quieres que sea obligatoria, cambia a error aquí
             val = str(v).strip()
             if not IP_REGEX.fullmatch(val):
-                errs.append((i, df.columns[col_idx], col_idx, "ip_invalida", "IP inválida: debe tener 4 segmentos 0–255 (ej. 172.18.9.10)", "error"))
+                errs.append(
+                    (
+                        i,
+                        df.columns[col_idx],
+                        col_idx,
+                        "ip_invalida",
+                        "IP inválida: debe tener 4 segmentos 0–255 (ej. 172.18.9.10)",
+                        "error",
+                    )
+                )
 
-    # TELEFONO válido — si existe la columna "TELEFONOS"
+    # ================== TELÉFONOS ==================
     if PHONE_COL_NAME in df.columns:
         c = PHONE_COL_NAME
         col_idx = df.columns.get_loc(c)
@@ -677,7 +817,6 @@ def validate_position_rules(df: pd.DataFrame) -> pd.DataFrame:
             # Puede venir "04121234567" o "04121234567 / 04141234567"
             parts = [p.strip() for p in s.split("/") if p.strip() != ""]
 
-            # Si no hay partes válidas -> error
             if not parts:
                 errs.append(
                     (
@@ -693,7 +832,7 @@ def validate_position_rules(df: pd.DataFrame) -> pd.DataFrame:
 
             ok = True
             for p in parts:
-                digits = re.sub(r"\D", "", p)  # solo números
+                digits = re.sub(r"\D", "", p)
                 if len(digits) != 11:
                     ok = False
                     break
@@ -710,8 +849,7 @@ def validate_position_rules(df: pd.DataFrame) -> pd.DataFrame:
                     )
                 )
 
-    # MAC: 12 caracteres hexadecimales corridos, sin separadores
-    # MAC: obligatoria, solo hex y formato XX:XX:XX:XX:XX:XX
+    # ================== MAC (OBLIGATORIA, FORMATO XX:XX:XX:XX:XX:XX) ==================
     if MAC_COL_NAME in df.columns:
         c = MAC_COL_NAME
         col_idx = df.columns.get_loc(c)
@@ -719,7 +857,7 @@ def validate_position_rules(df: pd.DataFrame) -> pd.DataFrame:
         for i, v in df[c].items():
             s = "" if pd.isna(v) else str(v).strip().upper()
 
-            # ❌ No puede estar vacía
+            # No puede estar vacía
             if s == "":
                 errs.append(
                     (
@@ -733,7 +871,7 @@ def validate_position_rules(df: pd.DataFrame) -> pd.DataFrame:
                 )
                 continue
 
-            # ✅ Validar formato: XX:XX:XX:XX:XX:XX solo hex en mayúsculas
+            # Debe cumplir XX:XX:XX:XX:XX:XX en hex mayúscula
             if not MAC_REGEX.fullmatch(s):
                 errs.append(
                     (
@@ -746,29 +884,34 @@ def validate_position_rules(df: pd.DataFrame) -> pd.DataFrame:
                     )
                 )
 
-
-    # VLAN opcional pero si viene debe ser entera
+    # ================== VLAN OPCIONAL PERO ENTERA ==================
     if "VLAN" in df.columns:
         c = "VLAN"
         col_idx = df.columns.get_loc(c)
         for i, v in df[c].items():
             if pd.isna(v) or str(v).strip() == "":
-                continue  # es opcional
+                continue  # opcional
 
             val = str(v).strip()
 
-            # eliminar decimales tipo "1003.0"
+            # "1003.0" lo damos como válido (se corrige después)
             if re.fullmatch(r"\d+\.0+", val):
-                continue  # lo damos como válido porque igual se autocorregirá
+                continue
 
-            # validar solo enteros puros
+            # Solo enteros puros
             if not re.fullmatch(r"\d+", val):
-                errs.append((i, c, col_idx,
-                            "vlan_invalida",
-                            "VLAN debe ser número entero (ej: 1003), sin decimales ni letras.",
-                            "error"))
+                errs.append(
+                    (
+                        i,
+                        c,
+                        col_idx,
+                        "vlan_invalida",
+                        "VLAN debe ser número entero (ej: 1003), sin decimales ni letras.",
+                        "error",
+                    )
+                )
 
-    # --- NUMERO DE SERIE ONT: limpiar y validar ---
+    # ================== NUMERO DE SERIE ONT ==================
     ONT_COL = "NUMERO DE SERIE ONT"
     if ONT_COL in df.columns:
         col_idx = df.columns.get_loc(ONT_COL)
@@ -776,41 +919,48 @@ def validate_position_rules(df: pd.DataFrame) -> pd.DataFrame:
         for i, v in df[ONT_COL].items():
             raw = "" if pd.isna(v) else str(v)
 
-            # 1. Limpieza → solo letras y números
             cleaned = re.sub(r"[^A-Za-z0-9]", "", raw).upper()
+            df.at[i, ONT_COL] = cleaned  # se guarda limpio
 
-            # Guardamos limpieza en el DF para mostrarla corregida
-            df.at[i, ONT_COL] = cleaned
-
-            # 2. Validación
             if cleaned == "":
-                errs.append((
-                    i, ONT_COL, col_idx,
-                    "ont_vacio",
-                    "NUMERO DE SERIE ONT es obligatorio.",
-                    "error"
-                ))
+                errs.append(
+                    (
+                        i,
+                        ONT_COL,
+                        col_idx,
+                        "ont_vacio",
+                        "NUMERO DE SERIE ONT es obligatorio.",
+                        "error",
+                    )
+                )
                 continue
 
             if len(cleaned) not in (14, 16):
-                errs.append((
-                    i, ONT_COL, col_idx,
-                    "ont_longitud_invalida",
-                    f"Debe tener exactamente 14 o 16 caracteres (actual: {len(cleaned)}).",
-                    "error"
-                ))
+                errs.append(
+                    (
+                        i,
+                        ONT_COL,
+                        col_idx,
+                        "ont_longitud_invalida",
+                        f"Debe tener exactamente 14 o 16 caracteres (actual: {len(cleaned)}).",
+                        "error",
+                    )
+                )
                 continue
 
-            # 3. Verificación final: solo alfanumérico
             if not re.fullmatch(r"[A-Za-z0-9]+", cleaned):
-                errs.append((
-                    i, ONT_COL, col_idx,
-                    "ont_formato_invalido",
-                    "Debe contener solo letras y números.",
-                    "error"
-                ))
+                errs.append(
+                    (
+                        i,
+                        ONT_COL,
+                        col_idx,
+                        "ont_formato_invalido",
+                        "Debe contener solo letras y números.",
+                        "error",
+                    )
+                )
 
-    # Campos obligatorios adicionales
+    # ================== CAMPOS OBLIGATORIOS GENERALES ==================
     mandatory_cols = [
         "* CODIGO CONTRATO",
         "* NOMBRES",
@@ -860,8 +1010,12 @@ def validate_position_rules(df: pd.DataFrame) -> pd.DataFrame:
                     )
 
     if not errs:
-        return pd.DataFrame(columns=["fila","columna","col_idx","regla","detalle","severity"])
-    return pd.DataFrame(errs, columns=["fila","columna","col_idx","regla","detalle","severity"])
+        return pd.DataFrame(columns=["fila", "columna", "col_idx", "regla", "detalle", "severity"])
+
+    return pd.DataFrame(
+        errs,
+        columns=["fila", "columna", "col_idx", "regla", "detalle", "severity"],
+    )
 
 # ---------- Estilos de errores ----------
 def build_error_mask_by_position(df: pd.DataFrame, errores: pd.DataFrame):
