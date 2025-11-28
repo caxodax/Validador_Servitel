@@ -226,6 +226,7 @@ def load_rules():
         return yaml.safe_load(f)
 rules_pkg = load_rules()
 COLUMN_ORDER = rules_pkg.get("column_order", None)
+
 # ---------- Normalización de nombres de columnas para comparación ----------
 def normalize_colname_for_match(name: str) -> str:
     """
@@ -287,6 +288,7 @@ def build_column_config(df: pd.DataFrame):
         label = "" if is_unnamed(c) else str(c)
         cfg[c] = st.column_config.Column(label=label)
     return cfg
+
 # ------- Resalta el error de columnas ---------------
 def highlight_column_list(columns, diff_df):
     """
@@ -327,6 +329,7 @@ def convert_int_columns(df: pd.DataFrame, int_cols: list[str]) -> pd.DataFrame:
             # quitar .0 si es entero
             df2[col] = df2[col].apply(lambda x: int(x) if isinstance(x, float) and x.is_integer() else x)
     return df2
+
 # ---------- Columnas duplicadas: helpers ----------
 def make_unique_labels(labels):
     seen = {}
@@ -727,7 +730,6 @@ MAC_COL_NAME = "MAC"
 MAC_REGEX = re.compile(r'^([0-9A-F]{2}:){5}[0-9A-F]{2}$')
 
 
-
 def validate_position_rules(df: pd.DataFrame) -> pd.DataFrame:
     errs = []
 
@@ -794,12 +796,17 @@ def validate_position_rules(df: pd.DataFrame) -> pd.DataFrame:
                     )
                 )
 
-    # ================== TELÉFONOS ==================
+    # ================== TELEFONOS ==================
     if PHONE_COL_NAME in df.columns:
         c = PHONE_COL_NAME
         col_idx = df.columns.get_loc(c)
+
         for i, v in df[c].items():
-            s = "" if pd.isna(v) else str(v).strip()
+            s = "" if pd.isna(v) else str(v)
+
+            # Normalizar: eliminar espacios dobles, saltos, caracteres raros
+            s = s.replace("−", "-").replace("–", "-")
+            s = s.replace("  ", " ").strip()
 
             if s == "":
                 errs.append(
@@ -814,8 +821,9 @@ def validate_position_rules(df: pd.DataFrame) -> pd.DataFrame:
                 )
                 continue
 
-            # Puede venir "04121234567" o "04121234567 / 04141234567"
-            parts = [p.strip() for p in s.split("/") if p.strip() != ""]
+            # Separar por "/", pero ignorando espacios vacíos y entradas vacías
+            raw_parts = s.split("/")
+            parts = [p.strip() for p in raw_parts if p.strip() != ""]
 
             if not parts:
                 errs.append(
@@ -832,7 +840,10 @@ def validate_position_rules(df: pd.DataFrame) -> pd.DataFrame:
 
             ok = True
             for p in parts:
+                # Extraer solo dígitos
                 digits = re.sub(r"\D", "", p)
+
+                # validación real
                 if len(digits) != 11:
                     ok = False
                     break
@@ -952,7 +963,7 @@ def validate_position_rules(df: pd.DataFrame) -> pd.DataFrame:
                 errs.append(
                     (
                         i,
-                        ONT_COL,
+                        ONT_COL, 
                         col_idx,
                         "ont_formato_invalido",
                         "Debe contener solo letras y números.",
@@ -1012,6 +1023,7 @@ def validate_position_rules(df: pd.DataFrame) -> pd.DataFrame:
     if not errs:
         return pd.DataFrame(columns=["fila", "columna", "col_idx", "regla", "detalle", "severity"])
 
+
     return pd.DataFrame(
         errs,
         columns=["fila", "columna", "col_idx", "regla", "detalle", "severity"],
@@ -1050,6 +1062,33 @@ def idx_to_excel_col(idx: int) -> str:
         result = chr(65 + r) + result
     return result
 
+# --- Helper para obtener coordenadas (fila, col_idx) de errores ---
+def get_error_coords(errores: pd.DataFrame):
+    """
+    Devuelve un conjunto de coordenadas (fila, col_idx) de las celdas con error.
+    Solo usa col_idx cuando está presente y no es NaN.
+    """
+    coords = set()
+    if errores is None or errores.empty:
+        return coords
+
+    has_col_idx = "col_idx" in errores.columns
+
+    for _, r in errores.iterrows():
+        try:
+            fila = int(r["fila"])
+        except Exception:
+            continue
+
+        if has_col_idx and not pd.isna(r["col_idx"]):
+            try:
+                col = int(r["col_idx"])
+            except Exception:
+                continue
+            coords.add((fila, col))
+
+    return coords
+
 def style_error_cells_ui(df: pd.DataFrame, errores: pd.DataFrame):
     # Creamos una copia con columnas únicas SOLO para la UI
     disp = ui_df_with_unique_columns(df)
@@ -1059,12 +1098,16 @@ def style_error_cells_ui(df: pd.DataFrame, errores: pd.DataFrame):
     # Máscara de errores sigue 0-based (coincide con el DF original)
     pos_mask = build_error_mask_by_position(df, errores)
 
+    # Coordenadas revalidadas (celdas que ANTES tenían error y ahora ya no)
+    resolved_coords = st.session_state.get("resolved_coords", set())
+
     def apply_colors(row):
         i_display = row.name      # 1, 2, 3, ...
         i0 = int(i_display) - 1   # índice real 0-based
 
         styles = []
         for j in range(len(row)):
+            # severidad actual (error/warn/info) sobre esta vista
             if 0 <= i0 < pos_mask.shape[0]:
                 sev = pos_mask.iat[i0, j]
             else:
@@ -1077,7 +1120,11 @@ def style_error_cells_ui(df: pd.DataFrame, errores: pd.DataFrame):
             elif sev == "error":
                 styles.append("background-color: #ffd6d6")
             else:
-                styles.append("")
+                # Si ya NO tiene error, pero su coordenada estuvo en errores previos -> marcado verde
+                if (i0, j) in resolved_coords:
+                    styles.append("background-color: #d4edda")  # verde suave (revalidado)
+                else:
+                    styles.append("")
         return styles
 
     return disp.style.apply(apply_colors, axis=1)
@@ -1220,7 +1267,10 @@ if "edited_df" not in st.session_state:
     st.session_state["edited_df"] = None
 if "file_id" not in st.session_state:
     st.session_state["file_id"] = None
-
+if "resolved_coords" not in st.session_state:
+    st.session_state["resolved_coords"] = set()
+if "last_errores" not in st.session_state:
+    st.session_state["last_errores"] = None
 
 
 if archivo:
@@ -1233,6 +1283,8 @@ if archivo:
             st.session_state["file_id"] = file_id
             st.session_state["current_df"] = None
             st.session_state["edited_df"] = None
+            st.session_state["resolved_coords"] = set()
+            st.session_state["last_errores"] = None
 
         # --- LECTURA INTELIGENTE DESDE CERO SOLO SI AÚN NO HAY DF VIVO ---
         if st.session_state["current_df"] is None:
@@ -1271,7 +1323,6 @@ if archivo:
         errores_yaml = validate_dataframe(df_valid, rules_pkg)
         errores_pos  = validate_position_rules(df_valid)
 
-
         tipo_errs = tipo_errs_all.copy()
         if not tipo_errs.empty:
             tipo_errs["fila"] = tipo_errs["fila"].astype(int)
@@ -1284,14 +1335,30 @@ if archivo:
                     e["severity"] = "error"
                 frames.append(e)
 
-        errores = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["fila","columna","col_idx","regla","detalle","severity"])
+        errores = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
+            columns=["fila","columna","col_idx","regla","detalle","severity"]
+        )
+
+        # --------- Cálculo de celdas revalidadas (antes tenían error, ahora no) ---------
+        prev_errores = st.session_state.get("last_errores", None)
+
+        coords_actuales = get_error_coords(errores)
+        coords_previos  = get_error_coords(prev_errores) if prev_errores is not None else set()
+
+        nuevos_revalidados = coords_previos - coords_actuales
+
+        prev_revalidados = st.session_state.get("resolved_coords", set())
+        resolved_coords = prev_revalidados.union(nuevos_revalidados)
+
+        st.session_state["resolved_coords"] = resolved_coords
+        st.session_state["last_errores"] = errores.copy()
 
         # =================== SIGUE TODO LO DEMÁS ===================
 
         # --- VISTA PREVIA con sombreado ---
-        st.subheader("Vista previa Informacion (Error=🔴, Aviso=🟡, Info=🟢)")
+        st.subheader("Vista previa Informacion (🔴 Error, 🟡 Aviso, 🟢 Info, ✅ Revalidado en verde)")
         df_preview = convert_int_columns(
-            format_dates_for_display(pick_live_df().head(20), rules_pkg),
+            format_dates_for_display(pick_live_df().head(50), rules_pkg),
             INT_COLUMNS
         )     
         st.dataframe(style_error_cells_ui(df_preview, errores), use_container_width=True)
@@ -1322,7 +1389,7 @@ if archivo:
                         st.dataframe(diff_view, use_container_width=True)
                         st.markdown("---")
 
-                    # --- Listado completo, con letras y resaltando columnas problemáticas ---
+                        # --- Listado completo, con letras y resaltando columnas problemáticas ---
                         st.write("Listado completo de columnas esperadas:")
                         st.markdown("<br>".join(highlight_column_list(expected_cols, diff_df)), unsafe_allow_html=True)
 
@@ -1334,8 +1401,6 @@ if archivo:
             else:
                 st.success("✅ Estructura OK (columnas y orden coherentes).")
 
-
-
         # Correcciones de correo aplicadas (info)
         if enable_autocorrect and corrections_df is not None and not corrections_df.empty:
             corr_show = corrections_df.copy()
@@ -1344,43 +1409,90 @@ if archivo:
             st.dataframe(corr_show, use_container_width=True)
 
         # ---- Errores ----
+              
         if not errores.empty:
             # Indicar la hoja donde se están encontrando los errores
             st.subheader("Vista Previa Incidencias")
             st.info(f"Incidencias detectadas en la hoja de Excel: **'{MAESTRO_SHEET}'**")
 
-                       # Añadir columna con letra de columna Excel para que el usuario lo entienda mejor
-            # Añadir columna con letra de columna Excel para que el usuario lo entienda mejor
+            # Copia de trabajo
             errores_mostrar = errores.copy()
-            errores_mostrar["Importancia"] = errores_mostrar["severity"].str.lower().map(SEVERITY_MAP_ES)
-            if "col_idx" in errores_mostrar.columns:
-                errores_mostrar["columna_excel"] = errores_mostrar["col_idx"].apply(idx_to_excel_col)
-           
 
-                # Reordenar para que sea coordenada fácil: Columna (Excel) + Fila
-                cols = list(errores_mostrar.columns)
-                new_order = []
-                if "columna_excel" in cols:
-                    new_order.append("columna_excel")  # primero la columna Excel
-                if "fila" in cols:
-                    new_order.append("fila")           # luego la fila → coordenada tipo G | 15
-                # el resto
-                new_order += [c for c in cols if c not in new_order]
-                errores_mostrar = errores_mostrar[new_order]
-            
+            # Rellenar col_idx faltantes usando el nombre de columna
+            if "col_idx" in errores_mostrar.columns:
+                # Mapa nombre -> índice real del DF vivo
+                name_to_idx = {
+                    str(c): j for j, c in enumerate(st.session_state["current_df"].columns)
+                }
+
+                # Solo filas donde col_idx viene vacío / NaN
+                mask_na = errores_mostrar["col_idx"].isna()
+                if mask_na.any():
+                    errores_mostrar.loc[mask_na, "col_idx"] = (
+                        errores_mostrar.loc[mask_na, "columna"]
+                        .astype(str)
+                        .map(name_to_idx)
+                    )
+
+                # Aseguramos tipo entero nullable y calculamos letra de columna Excel
+                errores_mostrar["col_idx"] = errores_mostrar["col_idx"].astype("Int64")
+                errores_mostrar["columna_excel"] = errores_mostrar["col_idx"].apply(
+                    idx_to_excel_col
+                )
+
+            # Severidad en español
+            errores_mostrar["Importancia"] = errores_mostrar["severity"].str.lower().map(
+                SEVERITY_MAP_ES
+            )
+
+            # Reordenar para que sea coordenada fácil: Columna (Excel) + Fila
+            cols = list(errores_mostrar.columns)
+            new_order = []
+            if "columna_excel" in cols:
+                new_order.append("columna_excel")  # primero la columna Excel
+            if "fila" in cols:
+                new_order.append("fila")  # luego la fila → coordenada tipo G | 15
+            # el resto
+            new_order += [c for c in cols if c not in new_order]
+            errores_mostrar = errores_mostrar[new_order]
+
+            # Índice visible 1,2,3...
             errores_mostrar.index = errores_mostrar.index + 1
 
-            # 🔒 Ocultar columnas internas en la vista (pero NO borrarlas del DF original)
+            # Ocultar columnas internas en la vista (pero NO borrarlas del DF original)
             cols_visibles = [
-                c for c in errores_mostrar.columns
-                if c not in ("col_idx", "idxinterno", "severity")  # aquí puedes añadir más internas si quieres
+                c
+                for c in errores_mostrar.columns
+                if c not in ("col_idx", "idxinterno", "severity")
             ]
 
             st.warning(f"⚠️ Se encontraron {len(errores)} incidencias.")
             st.dataframe(errores_mostrar[cols_visibles], use_container_width=True)
 
+            # --- Botón extra: descargar MAESTRO con SOLO las celdas con incidencias marcadas en rojo ---
+            st.info(
+                "También puedes descargar un Excel con todas las filas pero "
+                "solo las celdas con incidencias sombreadas en rojo."
+            )
+            if st.button("⬇️ Generar Excel con celdas en error", key="btn_generate_errors_file"):
+                df_export_err = pick_live_df().copy()
+                xlsx_bytes_err = write_excel_with_errors(
+                    df_export_err, errores, rules_pkg, title_for_unnamed="INFORMACION DEL ABONADO"
+                )
+                st.session_state["xlsx_errors_file"] = xlsx_bytes_err
+
+            # Si el archivo ya está generado → mostrar botón para descargarlo
+            if "xlsx_errors_file" in st.session_state:
+                st.download_button(
+                    "⬇️ Descargar MAESTRO_errores.xlsx",
+                    st.session_state["xlsx_errors_file"],
+                    "MAESTRO_errores.xlsx",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="btn_download_errors_file",
+                )
 
 
+           
 
             # ============== EDITOR DE INCIDENCIAS (CELDA POR CELDA) ==============
             st.markdown("## Editor de incidencias (por fila/columna)")
@@ -1501,7 +1613,6 @@ if archivo:
                 st.session_state["current_df"] = df_editado.copy()
                 st.session_state["edited_df"] = df_editado.copy()
 
-
             # Descarga "de todos modos" ANTES de revalidar
             st.info("¿Deseas descargar el MAESTRO corregido aunque aún haya incidencias?")
             confirm_anytime = st.checkbox("Sí, descargar MAESTRO_corregido.xlsx con posibles errores.", key="dl_anytime")
@@ -1517,7 +1628,7 @@ if archivo:
                     key="download_anytime_btn"
                 )
 
-                       # Revalidar (respeta edición)
+            # Revalidar (respeta edición)
             st.markdown("---")
             if st.button("Revalidar"):
                 df2 = pick_live_df().copy()
@@ -1540,7 +1651,6 @@ if archivo:
 
                 # Relanzar la app para que vista previa + incidencias se regeneren con df2
                 st.rerun()
-
 
         else:
             st.success("✅ Sin errores desde la fila 1.")
