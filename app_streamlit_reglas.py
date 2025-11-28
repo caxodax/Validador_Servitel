@@ -393,11 +393,33 @@ def format_dates_for_display(df: pd.DataFrame, rules_pkg):
     return out
 
 # ---------- Transformaciones ----------
-def force_uppercase_first_cols(df: pd.DataFrame, n: int) -> pd.DataFrame:
+def force_uppercase_first_cols(df: pd.DataFrame, n: int) -> tuple[pd.DataFrame, int]:
+    """
+    Pone en MAYÚSCULAS las primeras n columnas y devuelve:
+      - df2: DataFrame modificado
+      - changed_count: número de celdas que cambiaron realmente
+    """
     df2 = df.copy()
-    for c in list(df2.columns)[:max(0, n)]:
-        df2[c] = df2[c].map(lambda v: v if pd.isna(v) else str(v).upper())
-    return df2
+    changed_count = 0
+
+    cols = list(df2.columns)[:max(0, n)]
+    for c in cols:
+        col = df2[c]
+
+        # Nueva columna en mayúsculas (manteniendo NaN)
+        new_col = col.map(lambda v: v if pd.isna(v) else str(v).upper())
+
+        # Contar diferencias reales (ignorando NaN)
+        try:
+            mask = (~col.isna()) & (col.astype(str) != new_col.astype(str))
+            changed_count += int(mask.sum())
+        except Exception:
+            # Si algo raro pasa con los tipos, asumimos sin conteo fino
+            pass
+
+        df2[c] = new_col
+
+    return df2, changed_count
 
 def digits_only_column(df: pd.DataFrame, pos: int) -> pd.DataFrame:
     if pos >= len(df.columns):
@@ -446,18 +468,21 @@ def normalize_vlan(df: pd.DataFrame) -> pd.DataFrame:
     return df2
 
 # ---------- Normalización de texto: acentos/ñ -> con apóstrofe pegado ----------
-def normalize_text_apostrophe(df: pd.DataFrame) -> pd.DataFrame:
+def normalize_text_apostrophe(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     """
     Reemplaza acentos y ñ por su versión con apóstrofe pegado en TODAS las columnas de texto,
     excepto en columnas sensibles (E-MAIL/EMAIL, IP, MAC).
-    Trabaja por POSICIÓN para evitar problemas con nombres duplicados.
+
+    Devuelve:
+      - df2: DataFrame modificado
+      - changed_count: número de celdas que cambiaron realmente
     """
     df2 = df.copy()
+    changed_count = 0
 
     # columnas a excluir por nombre (en mayúsculas para comparar)
     excluded_cols = {"* E-MAIL", "E-MAIL", "EMAIL", "IP", "MAC"}
 
-    # mapeo de reemplazos
     repl = {
         "á": "a'", "é": "e'", "í": "i'", "ó": "o'", "ú": "u'",
         "Á": "A'", "É": "E'", "Í": "I'", "Ó": "O'", "Ú": "U'",
@@ -477,11 +502,21 @@ def normalize_text_apostrophe(df: pd.DataFrame) -> pd.DataFrame:
         col_name_upper = str(df2.columns[j]).strip().upper()
         if col_name_upper in excluded_cols:
             continue
+
         col = df2.iloc[:, j]
         if pd.api.types.is_object_dtype(col) or pd.api.types.is_string_dtype(col):
-            df2.iloc[:, j] = col.map(_fix_text)
+            new_col = col.map(_fix_text)
 
-    return df2
+            # Contar diferencias reales (ignorando NaN)
+            try:
+                mask = (~col.isna()) & (col.astype(str) != new_col.astype(str))
+                changed_count += int(mask.sum())
+            except Exception:
+                pass
+
+            df2.iloc[:, j] = new_col
+
+    return df2, changed_count
 
 DOC_PREFIX_MAP = {"J": "JURIDICO", "V": "CEDULA", "G": "GOBIERNO", "E": "EXTRANJERO"}
 
@@ -1271,6 +1306,18 @@ if "resolved_coords" not in st.session_state:
     st.session_state["resolved_coords"] = set()
 if "last_errores" not in st.session_state:
     st.session_state["last_errores"] = None
+# Nuevos estados para mejorar rendimiento de validación
+if "errores" not in st.session_state:
+    st.session_state["errores"] = None
+if "needs_validation" not in st.session_state:
+    st.session_state["needs_validation"] = False
+if "tipo_errs_all" not in st.session_state:
+    st.session_state["tipo_errs_all"] = pd.DataFrame(columns=["fila","columna","col_idx","regla","detalle","severity"])
+if "corrections_df" not in st.session_state:
+    st.session_state["corrections_df"] = pd.DataFrame()
+if "info_email_errors" not in st.session_state:
+    st.session_state["info_email_errors"] = pd.DataFrame(columns=["fila","columna","col_idx","regla","detalle","severity"])
+
 
 
 if archivo:
@@ -1293,51 +1340,100 @@ if archivo:
             # Normalización base
             df_norm  = apply_non_destructive_normalization(df_raw)
             df_fixed = apply_auto_fixes(df_norm, rules_pkg)
-            df_fixed = force_uppercase_first_cols(df_fixed, n=UPPERCASE_N)
-            df_fixed, tipo_errs_all = infer_tipo_documento_from_docnum(df_fixed, TIPO_DOC_POS, DOC_NUM_POS)
-            df_fixed = normalize_text_apostrophe(df_fixed)
 
+            # Mayúsculas primeras columnas + conteo
+            df_fixed, count_upper = force_uppercase_first_cols(df_fixed, n=UPPERCASE_N)
+
+            # Inferir tipo documento
+            df_fixed, tipo_errs_all = infer_tipo_documento_from_docnum(
+                df_fixed, TIPO_DOC_POS, DOC_NUM_POS
+            )
+
+            # Normalización de texto (acentos/ñ) + conteo
+            df_fixed, count_norm = normalize_text_apostrophe(df_fixed)
+
+            # Solo dígitos en N. DOCUMENTO
             df_fixed = digits_only_column(df_fixed, DOC_NUM_POS)
 
             if "MAC" in df_fixed.columns:
                 df_fixed["MAC"] = df_fixed["MAC"].map(clean_mac)
 
             df_fixed = normalize_vlan(df_fixed)
-            df_fixed, corrections_df, info_email_errors = apply_email_autocorrect(df_fixed, EMAIL_POS, enable_autocorrect)
+            df_fixed, corrections_df, info_email_errors = apply_email_autocorrect(
+                df_fixed, EMAIL_POS, enable_autocorrect
+            )
             df_fixed = convert_int_columns(df_fixed, INT_COLUMNS)
 
+            # Guardar DF vivo
             st.session_state["current_df"] = df_fixed.copy()
             st.session_state["edited_df"]  = None
+
+            # Guardar info auxiliar en sesión
+            st.session_state["tipo_errs_all"] = tipo_errs_all.copy()
+            st.session_state["corrections_df"] = corrections_df.copy()
+            st.session_state["info_email_errors"] = info_email_errors.copy()
+
+            # 👉 Guardar contadores de correcciones automáticas
+            st.session_state["count_uppercase"] = int(count_upper)
+            st.session_state["count_text_normalized"] = int(count_norm)
+
+            # También podemos guardar cuántos e-mails se corrigieron
+            st.session_state["count_email_autocorrect"] = int(len(corrections_df))
+
+            # Marcar que es necesario validar
+            st.session_state["needs_validation"] = True
+
         else:
             # Si ya tenemos DF vivo, seguimos usando ese
             df_fixed = pick_live_df().copy()
-            # Y no recalculamos tipo_errs_all ni corrections_df aquí
-            tipo_errs_all = pd.DataFrame(columns=["fila","columna","col_idx","regla","detalle","severity"])
-            corrections_df = pd.DataFrame()
-            info_email_errors = pd.DataFrame(columns=["fila","columna","col_idx","regla","detalle","severity"])
+            # Recuperamos info auxiliar de sesión (si existe)
+            tipo_errs_all = st.session_state.get(
+                "tipo_errs_all",
+                pd.DataFrame(columns=["fila","columna","col_idx","regla","detalle","severity"])
+            )
+            corrections_df = st.session_state.get("corrections_df", pd.DataFrame())
+            info_email_errors = st.session_state.get(
+                "info_email_errors",
+                pd.DataFrame(columns=["fila","columna","col_idx","regla","detalle","severity"])
+            )
 
-        # ---------------- VALIDACIÓN SIEMPRE SOBRE EL DF VIVO ----------------
-        df_valid = pick_live_df().copy()
-        df_valid.index = range(len(df_valid))
+                # ---------------- VALIDACIÓN (solo cuando es necesario) ----------------
+        if st.session_state.get("needs_validation", True):
+            df_valid = pick_live_df().copy()
+            df_valid.index = range(len(df_valid))
 
-        errores_yaml = validate_dataframe(df_valid, rules_pkg)
-        errores_pos  = validate_position_rules(df_valid)
+            errores_yaml = validate_dataframe(df_valid, rules_pkg)
+            errores_pos  = validate_position_rules(df_valid)
 
-        tipo_errs = tipo_errs_all.copy()
-        if not tipo_errs.empty:
-            tipo_errs["fila"] = tipo_errs["fila"].astype(int)
+            tipo_errs = tipo_errs_all.copy()
+            if not tipo_errs.empty:
+                tipo_errs["fila"] = tipo_errs["fila"].astype(int)
 
-        frames = []
-        for e in (errores_yaml, errores_pos, tipo_errs, info_email_errors):
-            if e is not None and not e.empty:
-                if "severity" not in e.columns:
-                    e = e.copy()
-                    e["severity"] = "error"
-                frames.append(e)
+            frames = []
+            for e in (errores_yaml, errores_pos, tipo_errs, info_email_errors):
+                if e is not None and not e.empty:
+                    if "severity" not in e.columns:
+                        e = e.copy()
+                        e["severity"] = "error"
+                    frames.append(e)
 
-        errores = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
-            columns=["fila","columna","col_idx","regla","detalle","severity"]
-        )
+            errores = pd.concat(
+                frames,
+                ignore_index=True
+            ) if frames else pd.DataFrame(
+                columns=["fila","columna","col_idx","regla","detalle","severity"]
+            )
+
+            # Cachear resultado en sesión
+            st.session_state["errores"] = errores.copy()
+            st.session_state["needs_validation"] = False
+        else:
+            # Reusar errores ya calculados
+            errores = st.session_state.get(
+                "errores",
+                pd.DataFrame(columns=["fila","columna","col_idx","regla","detalle","severity"])
+            )
+
 
         # --------- Cálculo de celdas revalidadas (antes tenían error, ahora no) ---------
         prev_errores = st.session_state.get("last_errores", None)
@@ -1405,8 +1501,26 @@ if archivo:
         if enable_autocorrect and corrections_df is not None and not corrections_df.empty:
             corr_show = corrections_df.copy()
             corr_show["fila"] = corr_show["fila"].astype(int)
-            st.info("Se aplicaron correcciones automáticas de e-mail:")
+
+            # Recuperar contadores de sesión
+            count_upper = int(st.session_state.get("count_uppercase", 0) or 0)
+            count_norm  = int(st.session_state.get("count_text_normalized", 0) or 0)
+            count_email = int(st.session_state.get("count_email_autocorrect", len(corr_show)) or 0)
+
+            # Total de correcciones automáticas
+            total_auto = count_upper + count_norm + count_email
+
+            # Texto con salto de línea
+            resumen = (
+                f"Correcciones automáticas totales: {total_auto} celdas modificadas.\n"
+                f"MAYÚSCULAS: {count_upper}, sin acentos/ñ: {count_norm}, "
+                f"correcciones de e-mail: {count_email}."
+            )
+
+            st.warning(resumen)
             st.dataframe(corr_show, use_container_width=True)
+
+
 
         # ---- Errores ----
               
@@ -1474,7 +1588,7 @@ if archivo:
                 "También puedes descargar un Excel con todas las filas pero "
                 "solo las celdas con incidencias sombreadas en rojo."
             )
-            if st.button("⬇️ Generar Excel con celdas en error", key="btn_generate_errors_file"):
+            if st.button("🔴 Generar Excel con celdas en error", key="btn_generate_errors_file"):
                 df_export_err = pick_live_df().copy()
                 xlsx_bytes_err = write_excel_with_errors(
                     df_export_err, errores, rules_pkg, title_for_unnamed="INFORMACION DEL ABONADO"
@@ -1484,7 +1598,7 @@ if archivo:
             # Si el archivo ya está generado → mostrar botón para descargarlo
             if "xlsx_errors_file" in st.session_state:
                 st.download_button(
-                    "⬇️ Descargar MAESTRO_errores.xlsx",
+                    "📁 Descargar MAESTRO_errores.xlsx",
                     st.session_state["xlsx_errors_file"],
                     "MAESTRO_errores.xlsx",
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1632,7 +1746,7 @@ if archivo:
             st.markdown("---")
             if st.button("Revalidar"):
                 df2 = pick_live_df().copy()
-                df2 = force_uppercase_first_cols(df2, n=UPPERCASE_N)
+                df2, _ = force_uppercase_first_cols(df2, n=UPPERCASE_N)
                 df2, _ = infer_tipo_documento_from_docnum(df2, TIPO_DOC_POS, DOC_NUM_POS)
 
                 # Forzar PAIS = VENEZUELA (si existe la columna)
@@ -1649,8 +1763,13 @@ if archivo:
                 st.session_state["current_df"] = df2.copy()
                 st.session_state["edited_df"] = None
 
+                # Marcar que hay que recalcular errores
+                st.session_state["needs_validation"] = True
+                st.session_state["errores"] = None
+
                 # Relanzar la app para que vista previa + incidencias se regeneren con df2
                 st.rerun()
+
 
         else:
             st.success("✅ Sin errores desde la fila 1.")
