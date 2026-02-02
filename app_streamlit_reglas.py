@@ -39,10 +39,83 @@ SEVERITY_MAP_ES = {
     "warn": "Aviso",
     "info": "Información"
 }
+def dedupe_errors_df(err_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Elimina incidencias duplicadas por celda.
+    Clave principal: (fila, col_idx) si col_idx existe.
+    Fallback: (fila, columna).
+
+    Preferencia:
+      - Regla más específica gana (telefono_vacio, ip_invalida, etc.)
+      - Si empata, gana la severidad más alta (error > warn > info)
+      - Si empata, gana el detalle más largo
+    """
+    if err_df is None or err_df.empty:
+        return pd.DataFrame(columns=["fila","columna","col_idx","regla","detalle","severity"])
+
+    df = err_df.copy()
+
+    # Normalizar columnas esperadas
+    for col in ["fila","columna","col_idx","regla","detalle","severity"]:
+        if col not in df.columns:
+            df[col] = None
+
+    # normalizaciones mínimas
+    df["fila"] = pd.to_numeric(df["fila"], errors="coerce").fillna(-1).astype(int)
+    df["columna"] = df["columna"].astype(str)
+    df["regla"] = df["regla"].astype(str)
+    df["detalle"] = df["detalle"].astype(str)
+    df["severity"] = df["severity"].astype(str).str.lower().replace({"warning":"warn"})
+
+    # Prioridad por regla (más específico > genérico)
+    rule_priority = {
+        "telefono_vacio": 100,
+        "telefono_invalido": 95,
+        "email_vacio": 90,
+        "email_sin_arroba": 85,
+        "email_invalido": 80,
+        "fecha_obligatoria": 80,
+        "mac_vacia": 80,
+        "mac_invalida": 75,
+        "ip_invalida": 70,
+        "vlan_invalida": 65,
+        "ont_vacio": 80,
+        "ont_longitud_invalida": 75,
+        "ont_formato_invalido": 70,
+        "campo_obligatorio": 10,     # genérica (pierde contra casi todo)
+    }
+
+    sev_priority = {"error": 3, "warn": 2, "info": 1}
+
+    # Key por celda: (fila, col_idx) si col_idx es válido, si no: (fila, columna)
+    has_col_idx = "col_idx" in df.columns
+    if has_col_idx:
+        df["_col_idx_valid"] = pd.to_numeric(df["col_idx"], errors="coerce")
+        df["_key"] = df.apply(
+            lambda r: (int(r["fila"]), int(r["_col_idx_valid"])) if pd.notna(r["_col_idx_valid"]) else (int(r["fila"]), str(r["columna"])),
+            axis=1
+        )
+    else:
+        df["_key"] = df.apply(lambda r: (int(r["fila"]), str(r["columna"])), axis=1)
+
+    df["_rp"] = df["regla"].map(lambda x: rule_priority.get(x, 50))
+    df["_sp"] = df["severity"].map(lambda x: sev_priority.get(x, 2))
+    df["_dl"] = df["detalle"].map(lambda x: len(str(x)))
+
+    # Orden: por key, luego mejor regla, luego severidad, luego detalle
+    df = df.sort_values(by=["_key","_rp","_sp","_dl"], ascending=[True, False, False, False])
+
+    # Mantener 1 por celda
+    df = df.drop_duplicates(subset=["_key"], keep="first")
+
+    # limpiar auxiliares
+    df = df.drop(columns=[c for c in ["_key","_rp","_sp","_dl","_col_idx_valid"] if c in df.columns], errors="ignore")
+    return df
+
 # ----- Columnas deben ser entero -----
 INT_COLUMNS = [
-    "* CODIGO CONTRATO",
-    "* N. DOCUMENTO",
+  #  "* CODIGO CONTRATO",
+  #  "* N. DOCUMENTO",
     "* DURACION (MESES)",
     "* DIA COBRO",
     "* DIA CORTE",
@@ -162,60 +235,83 @@ with col_center:
 # =================== LECTURA INTELIGENTE DE ENCABEZADOS ===================
 HEADER_ROW_INDEX = 1  # segunda fila (0-based)
 
+def _norm_cell_token(x: str) -> str:
+    s = "" if x is None else str(x)
+    s = s.replace("\xa0", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    # quita asteriscos iniciales y el espacio siguiente
+    s = re.sub(r"^\*+\s*", "", s)
+    return s.upper()
+
+def _trim_trailing_empty_rows(df: pd.DataFrame, anchor_col_name: str) -> pd.DataFrame:
+    """
+    Recorta el DF hasta la última fila donde anchor_col_name tiene valor real.
+    Evita miles de errores falsos por filas vacías formateadas en Excel.
+    """
+    if anchor_col_name not in df.columns:
+        return df
+
+    ser = df[anchor_col_name].astype(str).map(lambda v: v.strip())
+    # considera vacíos: "", "nan", "none", "null", "<na>"
+    is_real = ~ser.str.lower().isin({"", "nan", "none", "null", "<na>"})
+    if not is_real.any():
+        return df
+
+    last_idx = is_real[is_real].index.max()
+    out = df.loc[:last_idx].copy()
+    out.reset_index(drop=True, inplace=True)
+    return out
+
 def smart_read_maestro(file) -> pd.DataFrame:
     """
-    Lector inteligente compatible con TODOS los archivos:
-    1) Si encuentra la fila que contiene '* CODIGO CONTRATO' → usa esa como encabezado.
-    2) Si NO la encuentra → usa la heurística original (many_unnamed / título / fila 2).
-    Esto garantiza compatibilidad con archivos antiguos y con los nuevos.
+    Lector inteligente:
+    - Encuentra la fila header buscando 'CODIGO CONTRATO' (normalizado).
+    - Si no la encuentra, cae a la heurística anterior.
+    - Limpia columnas 'Unnamed'
+    - Recorta filas vacías al final usando '* CODIGO CONTRATO' (o equivalente normalizado) como ancla.
     """
-    # Leer hoja MAESTRO sin encabezado
-    df0 = pd.read_excel(
-        file, 
-        sheet_name=MAESTRO_SHEET, 
-        header=None, 
-        engine="openpyxl"
-    )
+    df0 = pd.read_excel(file, sheet_name=MAESTRO_SHEET, header=None, engine="openpyxl")
 
-    # --- INTENTO 1: Buscar explícitamente la fila con '* CODIGO CONTRATO' ---
+    target = "CODIGO CONTRATO"
     header_row = None
-    max_scan = min(12, len(df0))   # escanea primeras filas solamente
+
+    max_scan = min(20, len(df0))  # un poco más de margen
     for i in range(max_scan):
-        row_str = df0.iloc[i].astype(str).str.strip()
-        if "* CODIGO CONTRATO" in row_str.values:
+        row_norm = df0.iloc[i].map(_norm_cell_token)
+        if (row_norm == target).any():
             header_row = i
             break
 
-    # --- INTENTO 2: Heurística original (si no se encontró encabezado claro) ---
+    # fallback a heurística anterior
     if header_row is None:
         first_row = df0.iloc[0].astype(str)
         many_unnamed = (first_row.str.startswith("Unnamed")).mean() > 0.5
         has_title = first_row.str.contains("INFORMACION", case=False, na=False).any()
+        header_row = HEADER_ROW_INDEX if (many_unnamed or has_title) else 0
 
-        if many_unnamed or has_title:
-            header_row = HEADER_ROW_INDEX  # por defecto fila 1 (segunda)
-        else:
-            header_row = 0  # primera fila
+        # si en la fila 2 aparece CODIGO CONTRATO, úsala
+        if len(df0) > 1:
+            row1_norm = df0.iloc[1].map(_norm_cell_token)
+            if (row1_norm == target).any():
+                header_row = 1
 
-        # Reglas extra originales
-        try:
-            row1 = df0.iloc[1].astype(str).str.strip()
-            if "* CODIGO CONTRATO" in row1.values:
-                header_row = HEADER_ROW_INDEX
-        except Exception:
-            pass
-
-    # --- Construir encabezados y datos ---
     header = df0.iloc[header_row].astype(str).str.strip().tolist()
-    df = df0.iloc[header_row + 1 : ].copy()
+    df = df0.iloc[header_row + 1:].copy()
     df.columns = header
     df.reset_index(drop=True, inplace=True)
 
-    # Limpiar nombres tipo 'Unnamed'
-    df.columns = [
-        c if not str(c).lower().startswith("unnamed") else "" 
-        for c in df.columns
-    ]
+    # limpiar 'Unnamed'
+    df.columns = [c if not str(c).lower().startswith("unnamed") else "" for c in df.columns]
+
+    # encontrar la columna ancla (la que normaliza a 'CODIGO CONTRATO')
+    anchor = None
+    for c in df.columns:
+        if _norm_cell_token(c) == target:
+            anchor = c
+            break
+
+    if anchor:
+        df = _trim_trailing_empty_rows(df, anchor)
 
     return df
 
@@ -281,6 +377,43 @@ def compare_columns_with_details(expected, received):
 # ---------- Helpers encabezados (solo visual) ----------
 def is_unnamed(col_name) -> bool:
     return str(col_name).lower().startswith("unnamed")
+
+def run_full_pipeline(df_in: pd.DataFrame, enable_autocorrect: bool):
+    """
+    Aplica el mismo pipeline usado al cargar:
+    - uppercase primeras columnas
+    - inferir tipo documento
+    - normalizar texto (acentos)
+    - solo dígitos en N. DOCUMENTO
+    - limpiar MAC
+    - normalizar VLAN
+    - autocorrect email (si está habilitado)
+    - convertir int columnas
+    Retorna (df_out, tipo_errs_all, corrections_df, info_email_errors)
+    """
+    df = df_in.copy()
+
+    df, _ = force_uppercase_first_cols(df, n=UPPERCASE_N)
+
+    df, tipo_errs_all = infer_tipo_documento_from_docnum(df, TIPO_DOC_POS, DOC_NUM_POS)
+
+    df, _ = normalize_text_apostrophe(df)
+
+    df = digits_only_column(df, DOC_NUM_POS)
+
+    if "MAC" in df.columns:
+        df["MAC"] = df["MAC"].map(clean_mac)
+
+    df = normalize_vlan(df)
+
+    corrections_df = pd.DataFrame()
+    info_email_errors = pd.DataFrame(columns=["fila","columna","col_idx","regla","detalle","severity"])
+    if enable_autocorrect:
+        df, corrections_df, info_email_errors = apply_email_autocorrect(df, EMAIL_POS, True)
+
+    df = convert_int_columns(df, INT_COLUMNS)
+
+    return df, tipo_errs_all, corrections_df, info_email_errors
 
 def build_column_config(df: pd.DataFrame):
     cfg = {}
@@ -836,12 +969,26 @@ def validate_position_rules(df: pd.DataFrame) -> pd.DataFrame:
         c = PHONE_COL_NAME
         col_idx = df.columns.get_loc(c)
 
-        for i, v in df[c].items():
-            s = "" if pd.isna(v) else str(v)
+        def _to_digits(val) -> str:
+            if pd.isna(val):
+                return ""
+            # Si excel lo trae numérico (float) evita "....0" o notación científica
+            try:
+                import numpy as np
+                if isinstance(val, (int, np.integer)):
+                    return str(int(val))
+                if isinstance(val, (float, np.floating)):
+                    if float(val).is_integer():
+                        return str(int(val))
+                    # si no es entero, igual sacamos dígitos del string
+            except Exception:
+                pass
+            return re.sub(r"\D", "", str(val))
 
-            # Normalizar: eliminar espacios dobles, saltos, caracteres raros
-            s = s.replace("−", "-").replace("–", "-")
-            s = s.replace("  ", " ").strip()
+        for i, v in df[c].items():
+            s_raw = "" if pd.isna(v) else str(v)
+            s = s_raw.replace("−", "-").replace("–", "-")
+            s = re.sub(r"\s+", " ", s).strip()
 
             if s == "":
                 errs.append(
@@ -850,13 +997,12 @@ def validate_position_rules(df: pd.DataFrame) -> pd.DataFrame:
                         c,
                         col_idx,
                         "telefono_vacio",
-                        "Teléfono vacío o incompleto (se esperan 11 dígitos).",
+                        "Teléfono vacío o incompleto (se esperan 10 u 11 dígitos).",
                         "error",
                     )
                 )
                 continue
 
-            # Separar por "/", pero ignorando espacios vacíos y entradas vacías
             raw_parts = s.split("/")
             parts = [p.strip() for p in raw_parts if p.strip() != ""]
 
@@ -867,21 +1013,30 @@ def validate_position_rules(df: pd.DataFrame) -> pd.DataFrame:
                         c,
                         col_idx,
                         "telefono_invalido",
-                        "Teléfono inválido (use 11 dígitos, opcionalmente separados por '/').",
+                        "Teléfono inválido (use 10 u 11 dígitos, opcionalmente separados por '/').",
                         "error",
                     )
                 )
                 continue
 
+            normalized_parts = []
             ok = True
-            for p in parts:
-                # Extraer solo dígitos
-                digits = re.sub(r"\D", "", p)
+            corrected = False
 
-                # validación real
+            for p in parts:
+                digits = _to_digits(p)
+
+                # Si viene 10 dígitos (ej. 414xxxxxxx), le agregamos 0 → 0414xxxxxxx
+                if len(digits) == 10:
+                    digits = "0" + digits
+                    corrected = True
+
+                # Aceptamos solo 11 al final
                 if len(digits) != 11:
                     ok = False
                     break
+
+                normalized_parts.append(digits)
 
             if not ok:
                 errs.append(
@@ -890,10 +1045,16 @@ def validate_position_rules(df: pd.DataFrame) -> pd.DataFrame:
                         c,
                         col_idx,
                         "telefono_invalido",
-                        "Cada número debe tener exactamente 11 dígitos (ej. 04121234567 / 04141234567).",
+                        "Cada número debe tener 10 u 11 dígitos (ej. 414xxxxxxx o 0414xxxxxxx). "
+                        "Si viene con 10, el sistema agregará el 0.",
                         "error",
                     )
                 )
+            else:
+                # Si se corrigió (o si quieres siempre normalizar), guarda normalizado
+                if corrected:
+                    df.at[i, c] = " / ".join(normalized_parts)
+
 
     # ================== MAC (OBLIGATORIA, FORMATO XX:XX:XX:XX:XX:XX) ==================
     if MAC_COL_NAME in df.columns:
@@ -981,14 +1142,14 @@ def validate_position_rules(df: pd.DataFrame) -> pd.DataFrame:
                 )
                 continue
 
-            if len(cleaned) not in (14, 16):
+            if len(cleaned) not in (12, 16):
                 errs.append(
                     (
                         i,
                         ONT_COL,
                         col_idx,
                         "ont_longitud_invalida",
-                        f"Debe tener exactamente 14 o 16 caracteres (actual: {len(cleaned)}).",
+                        f"Debe tener exactamente 12 o 16 caracteres (actual: {len(cleaned)}).",
                         "error",
                     )
                 )
@@ -1423,6 +1584,9 @@ if archivo:
             ) if frames else pd.DataFrame(
                 columns=["fila","columna","col_idx","regla","detalle","severity"]
             )
+            # ✅ Deduplicar por celda para evitar 2 errores en la misma coordenada
+            errores = dedupe_errors_df(errores)
+
 
             # Cachear resultado en sesión
             st.session_state["errores"] = errores.copy()
@@ -1520,6 +1684,15 @@ if archivo:
             st.warning(resumen)
             st.dataframe(corr_show, use_container_width=True)
 
+        # ✅ Blindaje: usa siempre el errores final de sesión (dedupe + cache)
+        errores = st.session_state.get(
+            "errores",
+            errores if errores is not None else pd.DataFrame(columns=["fila","columna","col_idx","regla","detalle","severity"])
+        )
+
+        # Normaliza si por algún motivo viene None
+        if errores is None:
+            errores = pd.DataFrame(columns=["fila","columna","col_idx","regla","detalle","severity"])
 
 
         # ---- Errores ----
@@ -1648,7 +1821,13 @@ if archivo:
                     valores_actuales.append(val)
 
                 errores_editables["valor_actual"] = valores_actuales
-                errores_editables["nuevo_valor"] = errores_editables["valor_actual"]
+
+                # Forzar a texto para que sea compatible con st.column_config.TextColumn
+                errores_editables["valor_actual"] = errores_editables["valor_actual"].apply(
+                    lambda x: "" if pd.isna(x) else str(x)
+                ).astype("string")
+
+                errores_editables["nuevo_valor"] = errores_editables["valor_actual"].copy()
 
                 # Columnas que muestra el editor
                 editor_cols = [
@@ -1723,7 +1902,7 @@ if archivo:
 
                     if 0 <= fila_i < df_editado.shape[0] and 0 <= col_i < df_editado.shape[1]:
                         df_editado.iat[fila_i, col_i] = new_val
-
+                st.session_state["needs_validation"] = True
                 st.session_state["current_df"] = df_editado.copy()
                 st.session_state["edited_df"] = df_editado.copy()
 
@@ -1744,56 +1923,35 @@ if archivo:
 
             # Revalidar (respeta edición)
             st.markdown("---")
-            if st.button("Revalidar"):
-                df2 = pick_live_df().copy()
-                df2, _ = force_uppercase_first_cols(df2, n=UPPERCASE_N)
-                df2, _ = infer_tipo_documento_from_docnum(df2, TIPO_DOC_POS, DOC_NUM_POS)
+        if st.button("Revalidar"):
+            # ✅ Partimos del DF vivo (incluye lo editado)
+            df2 = pick_live_df().copy()
 
-                # Forzar PAIS = VENEZUELA (si existe la columna)
-                for country_col_name in ["PAIS", "* PAIS"]:
-                    if country_col_name in df2.columns:
-                        df2[country_col_name] = "VENEZUELA"
+            # Forzar PAIS = VENEZUELA (si existe la columna)
+            for country_col_name in ["PAIS", "* PAIS"]:
+                if country_col_name in df2.columns:
+                    df2[country_col_name] = "VENEZUELA"
 
-                df2 = digits_only_column(df2, DOC_NUM_POS)
-                if enable_autocorrect:
-                    df2, _, _ = apply_email_autocorrect(df2, EMAIL_POS, True)
-                df2 = convert_int_columns(df2, INT_COLUMNS)
+            # ✅ Aplicar pipeline completo y consistente
+            df2, tipo_errs_all_new, corrections_df_new, info_email_errors_new = run_full_pipeline(df2, enable_autocorrect)
 
-                # Guardar como DF vivo y limpiar editor
-                st.session_state["current_df"] = df2.copy()
-                st.session_state["edited_df"] = None
+            # Guardar DF vivo
+            st.session_state["current_df"] = df2.copy()
+            st.session_state["edited_df"] = None
 
-                # Marcar que hay que recalcular errores
-                st.session_state["needs_validation"] = True
-                st.session_state["errores"] = None
+            # ✅ Refrescar auxiliares para que no queden errores “viejos”
+            st.session_state["tipo_errs_all"] = tipo_errs_all_new.copy()
+            st.session_state["corrections_df"] = corrections_df_new.copy()
+            st.session_state["info_email_errors"] = info_email_errors_new.copy()
 
-                # Relanzar la app para que vista previa + incidencias se regeneren con df2
-                st.rerun()
+            # ✅ Recalcular errores en el próximo ciclo
+            st.session_state["needs_validation"] = True
+            st.session_state["errores"] = None
+
+            st.rerun()
 
 
-        else:
-            st.success("✅ Sin errores desde la fila 1.")
-            # Editor opcional antes de descargar — UI con columnas únicas
-            disp_ok = ui_df_with_unique_columns(format_dates_for_display(st.session_state["current_df"].copy(), rules_pkg))
-            edited_ok_disp = st.data_editor(
-                disp_ok,
-                use_container_width=True, num_rows="dynamic",
-                key="editor_ok"
-            )
-            edited_ok = edited_ok_disp.copy()
-            edited_ok.columns = st.session_state["current_df"].columns
-            st.session_state["edited_df"] = edited_ok.copy()
-
-            df_export = pick_live_df().copy()
-            if enable_autocorrect:
-                df_export, _, _ = apply_email_autocorrect(df_export, EMAIL_POS, True)
-
-            st.download_button(
-                "⬇️ Descargar Excel validado",
-                write_excel_validated(df_export, rules_pkg, title_for_unnamed="INFORMACION DEL ABONADO"),
-                "MAESTRO_corregido.xlsx",
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+        
 
     except Exception as e:
         st.exception(e)
